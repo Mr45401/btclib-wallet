@@ -15,11 +15,13 @@ the caller's: a `Ledger` takes paths.
 
 from __future__ import annotations
 
+import functools
 import os
 import platform
 import re
 import sqlite3
 import stat
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,9 @@ from btclib.tx import TxOut
 from btclib_wallet.exceptions import FetchError
 from btclib_wallet.ledger import APPLICATION_ID, FORMAT_VERSION, Ledger, store
 from tests.ledger.conftest import LOOKAHEAD, FakeChain, script_of, source
+from tests.ledger.store_test import refuse_removal
+from tests.refused_value_test import HEX, SPELLINGS
+from tests.secret_free import assert_secret_free
 
 _PYPY = platform.python_implementation() == "PyPy"
 # what a copy SQLite refuses to write raises: PyPy's `Connection.backup`
@@ -157,7 +162,11 @@ def test_a_backup_that_cannot_open_its_file_leaves_none(
     assert not backup.exists()
 
 
-def test_a_copy_that_cannot_write_names_the_copy_and_leaves_none(
+# the path is the caller's, and SQLite's text is not relayed
+_COPY_REFUSED = "^cannot copy the ledger file: OperationalError$"
+
+
+def test_a_copy_that_cannot_write_is_refused_and_leaves_none(
     ledger: Ledger, chain: FakeChain, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A write SQLite refuses, as on a full disk: the backup is not blamed.
@@ -177,13 +186,114 @@ def test_a_copy_that_cannot_write_names_the_copy_and_leaves_none(
     second = tmp_path / "second.bak"
     with pytest.raises(_COPY_REFUSALS) as refused:
         ledger.backup(second)
-    assert _PYPY or re.match("cannot copy into .*readonly", str(refused.value))
+    assert _PYPY or re.match(_COPY_REFUSED, str(refused.value))
     assert not second.exists()
     restored = tmp_path / "restored.sqlite"
     with pytest.raises(_COPY_REFUSALS) as refused:
         Ledger.restore(backup, restored, "regtest", chain)
-    assert _PYPY or re.match("cannot copy into .*readonly", str(refused.value))
+    assert _PYPY or re.match(_COPY_REFUSED, str(refused.value))
     assert not restored.exists()
+
+
+def _copies(
+    ledger: Ledger, chain: FakeChain, backup: Path, folder: Path
+) -> dict[Path, Callable[[], object]]:
+    """Return a backup and a restore into `folder`, by the file each makes."""
+    made = folder / "ledger.bak"
+    restored = folder / "restored.sqlite"
+    return {
+        made: functools.partial(ledger.backup, made),
+        restored: functools.partial(Ledger.restore, backup, restored, "regtest", chain),
+    }
+
+
+def test_a_copy_whose_file_cannot_be_removed_names_both_failures_by_class(
+    ledger: Ledger, chain: FakeChain, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key's hex in the path is in no refusal (issue #907).
+
+    SQLite fails the copy, as on a failing disk, and the system refuses to
+    remove the file made: the refusal names both errors by class, chains
+    neither, and the file is left.
+    """
+    backup = tmp_path / "ledger.bak"
+    ledger.backup(backup)
+    folder = tmp_path / HEX
+    folder.mkdir()
+    connect = store._connect
+
+    def failing(path: Path, mode: str) -> sqlite3.Connection:
+        if Path(path).parent == folder:
+            raise sqlite3.OperationalError("disk I/O error")
+        return connect(path, mode)
+
+    monkeypatch.setattr(store, "_connect", failing)
+    refuse_removal(monkeypatch, folder)
+    err_msg = "^cannot copy the ledger file: OperationalError;"
+    err_msg += " cannot remove the copy: PermissionError$"
+    for target, copy in _copies(ledger, chain, backup, folder).items():
+        with pytest.raises(BTClibValueError, match=err_msg) as e:
+            copy()
+        assert e.value.__cause__ is None
+        assert e.value.__context__ is None
+        assert_secret_free(e.value, SPELLINGS)
+        assert target.exists()
+
+
+def test_an_interrupted_copy_whose_file_cannot_be_removed_raises_the_interrupt(
+    ledger: Ledger, chain: FakeChain, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key's hex in the path is in no error (issue #907).
+
+    The copy is interrupted after making its file, and the system refuses
+    to remove that file: the interrupt is raised as it was, and the file
+    is left.
+    """
+    backup = tmp_path / "ledger.bak"
+    ledger.backup(backup)
+    folder = tmp_path / HEX
+    folder.mkdir()
+    connect = store._connect
+    interrupt = KeyboardInterrupt()
+
+    def interrupted(path: Path, mode: str) -> sqlite3.Connection:
+        if Path(path).parent == folder:
+            raise interrupt
+        return connect(path, mode)
+
+    monkeypatch.setattr(store, "_connect", interrupted)
+    refuse_removal(monkeypatch, folder)
+    for target, copy in _copies(ledger, chain, backup, folder).items():
+        with pytest.raises(KeyboardInterrupt) as e:
+            copy()
+        raised = e.value
+        assert id(raised) == id(interrupt)
+        assert raised.__context__ is None
+        assert_secret_free(raised, SPELLINGS)
+        assert target.exists()
+
+
+def test_a_refused_restore_whose_copy_cannot_be_removed_raises_its_refusal(
+    ledger: Ledger, chain: FakeChain, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key's hex in the path is in no refusal (issue #907).
+
+    The copy is made and its load refused, and the system refuses to
+    remove the copy: the load's refusal is raised as it was, and the copy
+    is left.
+    """
+    backup = tmp_path / "ledger.bak"
+    ledger.backup(backup)
+    folder = tmp_path / HEX
+    folder.mkdir()
+    target = folder / "restored.sqlite"
+    refuse_removal(monkeypatch, folder)
+    err_msg = "^a regtest ledger file, not a testnet one$"
+    with pytest.raises(BTClibValueError, match=err_msg) as e:
+        Ledger.restore(backup, target, "testnet", chain)
+    assert e.value.__context__ is None
+    assert_secret_free(e.value, SPELLINGS)
+    assert target.exists()
 
 
 @pytest.mark.parametrize("secure_delete", [0, 1])

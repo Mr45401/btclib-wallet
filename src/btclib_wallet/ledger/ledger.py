@@ -241,7 +241,6 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from math import ceil
 from os import PathLike
-from pathlib import Path
 from types import TracebackType
 from typing import Concatenate, ParamSpec, Self, TypeVar
 
@@ -288,7 +287,13 @@ from btclib_wallet.ledger.records import (
     Utxo,
     WalletTx,
 )
-from btclib_wallet.ledger.store import _copy_backup, _Source, _Store, _SyncWrite
+from btclib_wallet.ledger.store import (
+    _copy_backup,
+    _Source,
+    _Store,
+    _SyncWrite,
+    _undo_new_file,
+)
 from btclib_wallet.psbt.psbt import Psbt, extract_tx, finalize
 from btclib_wallet.psbt.psbt_in import PsbtIn
 from btclib_wallet.psbt.psbt_size import estimated_input_sizes, miniscript_sizer
@@ -581,11 +586,11 @@ class Ledger:
         (`RestoreWallet`, src/wallet/wallet.cpp:459-536 at
         bitcoin/bitcoin@f0de87f040, the v32.1 tag). A missing backup, a
         file already at `path`, and a backup that is no ledger file of
-        `network` are refused, with nothing left at `path`. The ledger
-        reads no backend here: its next `sync` reads from the tip the
-        backup holds. On a node that pruned blocks from that tip up,
-        `BitcoinCoreFetcher` fails that sync with a `FetchError`, where
-        Core refuses the restore itself.
+        `network` are refused, and a copy made at `path` is removed, as
+        `store`'s `_undo_new_file` says. The ledger reads no backend here:
+        its next `sync` reads from the tip the backup holds. On a node that
+        pruned blocks from that tip up, `BitcoinCoreFetcher` fails that
+        sync with a `FetchError`, where Core refuses the restore itself.
         """
         assert_type(backup, (str, PathLike), "backup")
         assert_type(path, (str, PathLike), "path")
@@ -603,7 +608,7 @@ class Ledger:
                 fallback_fee_rate=fallback_fee_rate,
             )
         except BaseException:
-            Path(path).unlink(missing_ok=True)
+            _undo_new_file(None, path)
             raise
 
     @_relocking

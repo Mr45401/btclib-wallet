@@ -333,26 +333,52 @@ def _new_file(path: str | PathLike[str]) -> None:
         raise BTClibValueError(f"the ledger file exists: {path}") from None
 
 
+def _undo_new_file(
+    db: sqlite3.Connection | None, path: str | PathLike[str]
+) -> str | None:
+    """Close `db` where it was opened, and remove the file at `path`.
+
+    Return the class name of the `OSError` a removal that fails raises,
+    None where the file is gone. That error is not raised: its text and
+    `filename` are the caller's path, which can hold anything, and it
+    would replace the failure being undone. The file is then left.
+    """
+    if db is not None:
+        _release(db)
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError as e:
+        return type(e).__name__
+    return None
+
+
 def _copy(db: sqlite3.Connection, path: str | PathLike[str]) -> None:
     """Write the pages of `db` into a new file at `path`.
 
-    A copy that fails after making the file removes it. A failure of
-    SQLite's is refused naming `path`, SQLite's own text saying what
-    failed, as a full disk or a file it cannot write.
+    A copy that fails after making the file removes it, as
+    `_undo_new_file` says. A failure of SQLite's is refused by the class
+    of SQLite's error, whose text is not relayed, and the refusal names a
+    removal that fails by the class of its error. It is raised after the
+    `except` block, so that it chains neither error. Any other failure
+    is raised as it is.
     """
     _new_file(path)
     target: sqlite3.Connection | None = None
     try:
         target = _connect(path, "rw")
         db.backup(target)
-    except BaseException as e:
-        if target is not None:
-            _release(target)
-        Path(path).unlink(missing_ok=True)
-        if isinstance(e, sqlite3.DatabaseError):
-            raise BTClibValueError(f"cannot copy into {path}: {e}") from None
+    except sqlite3.DatabaseError as e:
+        failure = f"cannot copy the ledger file: {type(e).__name__}"
+    except BaseException:
+        _undo_new_file(target, path)
         raise
-    _release(target)
+    else:
+        _release(target)
+        return
+    left = _undo_new_file(target, path)
+    if left is not None:
+        failure += f"; cannot remove the copy: {left}"
+    raise BTClibValueError(failure)
 
 
 def _copy_backup(backup: str | PathLike[str], path: str | PathLike[str]) -> None:
@@ -388,7 +414,8 @@ class _Store:
         the system has POSIX permissions; SQLite gives its journal the
         same permissions. The header, the tables and the network are
         written in one SQLite transaction. A create that fails after
-        making the file removes it, so nothing is left at `path`.
+        making the file removes it, as `_undo_new_file` says, and raises
+        its failure as it is.
         """
         _new_file(path)
         db: sqlite3.Connection | None = None
@@ -406,9 +433,7 @@ class _Store:
                 db.execute(f"PRAGMA user_version = {FORMAT_VERSION}")
                 db.execute("INSERT INTO meta VALUES ('network', ?)", (network,))
         except BaseException:
-            if db is not None:
-                _release(db)
-            Path(path).unlink(missing_ok=True)
+            _undo_new_file(db, path)
             raise
         return cls(db)
 
