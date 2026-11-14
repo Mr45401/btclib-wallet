@@ -276,6 +276,7 @@ def test_get_best_block_id_is_not_the_servers_word() -> None:
     "tip",
     [
         {"height": "not an int", "hex": TIP_HEADER_RAW},
+        {"height": -1, "hex": TIP_HEADER_RAW},
         {"height": TIP_HEIGHT},  # no "hex" member at all
         {"height": TIP_HEIGHT, "hex": "not hex at all!!"},
         "not an object",

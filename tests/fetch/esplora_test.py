@@ -483,6 +483,13 @@ def test_a_height_that_is_not_one(body: bytes) -> None:
         fetcher((200, body)).get_block_count()
 
 
+def test_a_negative_tip_height() -> None:
+    """Refuse a negative tip height, as a caller's (issue #901)."""
+    err_msg = "^blocks/tip/height: invalid height: a negative int of 1 bits < 0$"
+    with pytest.raises(FetchError, match=err_msg):
+        fetcher((200, b"-1")).get_block_count()
+
+
 @pytest.mark.parametrize("body", [b"not hex", b"", b"00" * 31])
 def test_a_tip_hash_that_is_not_one(body: bytes) -> None:
     """Refuse a tip-hash body that is not 32 bytes of hex."""

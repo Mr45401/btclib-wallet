@@ -303,7 +303,7 @@ class BitcoinCoreRestFetcher(NetworkVerifyingFetcher):
         self._verify_once()
         with fetch_errors("chaininfo"):
             reply = self._get_json("/chaininfo.json", max_body_size=_MAX_CHAININFO_BODY)
-            return int(_field(reply, "blocks"))
+            return block_header_height(_field(reply, "blocks"))
 
     @override
     def get_best_block_id(self) -> bytes:
