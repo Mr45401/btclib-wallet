@@ -279,12 +279,15 @@ class RangedWallet(Wallet, ABC):
     def _assert_position(self, branch: int, index: int) -> None:
         """Refuse a position this wallet has no output at.
 
-        The branch against `branches`, which is the one bound every
-        subclass shares; the index only for the sign, its upper bound
-        being the subclass's own -- 65535 from
+        The branch as an integer -- `True == 1` and `1.0 == 1` pass
+        membership in `branches` -- and against `branches`, which is the
+        one bound every subclass shares; the index only for the sign, its
+        upper bound being the subclass's own -- 65535 from
         `bip32.derive_from_account` where the branch is derived, and
         BIP32's own limit where a descriptor derives it.
         """
+        if not is_integer(branch):
+            raise BTClibTypeError(f"invalid branch type: {type(branch).__name__}")
         if branch not in self.branches:
             branches = ", ".join(str(b) for b in self.branches)
             err_msg = f"invalid branch: {branch} not in ({branches})"

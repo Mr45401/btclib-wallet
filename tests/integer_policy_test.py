@@ -44,7 +44,8 @@ _XPUB = xpub_from_xprv(rootxprv_from_seed("00" * 32))
 # check wants
 _ACCOUNT_XPRV = derive(rootxprv_from_seed("00" * 32), "m/44h/0h/0h")
 _DESCRIPTOR = parse(f"wpkh({_XPUB}/*)")
-_WALLET = DescriptorWallet([_DESCRIPTOR])
+_CHANGE_DESCRIPTOR = parse(f"wpkh({_XPUB}/1/*)")
+_WALLET = DescriptorWallet([_DESCRIPTOR, _CHANGE_DESCRIPTOR])
 
 
 def _psbt(**field: Any) -> Psbt:
@@ -122,6 +123,9 @@ _CASES: list[tuple[str, Callable[[Any], object]]] = [
         "wallet position_of last_index",
         lambda v: _WALLET.position_of(_DESCRIPTOR.script_pub_key(0), v),
     ),
+    # `_assert_position` checks membership in `branches`, which `False == 0`
+    # and `True == 1` pass (issue #923)
+    ("wallet position branch", lambda v: _WALLET.address(v, 0)),
 ]
 
 _IDS = [case[0] for case in _CASES]
@@ -194,6 +198,7 @@ def test_the_integers_a_bool_refusal_must_not_take_with_it() -> None:
     assert derive_from_account_(_ACCOUNT_XPRV, 1, 1, max_index=1).depth == 5
     assert _DESCRIPTOR.index_of(_DESCRIPTOR.script_pub_key(1), 1) == 1
     assert _WALLET.position_of(_DESCRIPTOR.script_pub_key(1), 1) == (0, 1)
+    assert _WALLET.address(1, 0) == _CHANGE_DESCRIPTOR.script_pub_key(0).address
 
     # the str and bytes spellings of a path are untouched by any of it
     assert indexes_from_der_path("m/44h/0h") == [2147483692, 2147483648]
@@ -202,13 +207,17 @@ def test_the_integers_a_bool_refusal_must_not_take_with_it() -> None:
 def test_what_is_no_integer_at_all_is_refused_the_same_way() -> None:
     """The policy is about integers, and a bool is only its sharpest case.
 
-    A derivation index that is no integer at all is refused as a type, and
-    not converted through `int()`.
+    A derivation index or a wallet position's branch that is no integer at
+    all is refused as a type, and not converted through `int()`.
     """
     with pytest.raises(BTClibTypeError, match="invalid derivation index type"):
         indexes_from_der_path([2.0])  # type: ignore[list-item]
     with pytest.raises(BTClibTypeError, match="invalid derivation index type"):
         str_from_index_int(1.0)  # type: ignore[arg-type]
+    with pytest.raises(BTClibTypeError, match="invalid branch type: float"):
+        _WALLET.address(1.0, 0)  # type: ignore[arg-type]
+    with pytest.raises(BTClibTypeError, match="invalid branch type: str"):
+        _WALLET.address("0", 0)  # type: ignore[arg-type]
 
 
 def test_an_int_subclass_that_is_not_a_bool_is_still_an_integer() -> None:
