@@ -4,10 +4,10 @@
 
 """Tests for `TcpPeerTransport` and `V2PeerTransport`, over a scripted socket.
 
-`FakeSocket` stands where `socket.create_connection` returns: it hands
-out the octets it was given, in the pieces it was given them in, and
-records what is written. `V2Peer` is one that answers the v2 handshake
-as a responder. No socket is opened.
+`FakeSocket` stands where `_open_connection` returns: it hands out the
+octets it was given, in the pieces it was given them in, and records
+what is written. `V2Peer` is one that answers the v2 handshake as a
+responder. No socket is opened.
 `tests/integration/compact_filters_test.py` is where a real one is.
 """
 
@@ -31,6 +31,7 @@ from typing_extensions import override
 from btclib_wallet.fetch import peer_transport
 from btclib_wallet.fetch import transport as fetch_transport
 from btclib_wallet.fetch.peer_transport import TcpPeerTransport, V2PeerTransport
+from tests import raises_alone
 
 MAGIC = b"\xfa\xbf\xb5\xda"
 MESSAGE = Ping(7).to_message(MAGIC)
@@ -88,10 +89,6 @@ class FakeSocket:
         if self.close_error is not None:
             raise self.close_error
 
-    def fileno(self) -> int:
-        """Return -1 once closed, as a socket does."""
-        return -1 if self.closed else 3
-
 
 def set_clock(monkeypatch: pytest.MonkeyPatch, clock: Callable[[], float]) -> None:
     """Replace the clock of the deadline and of the time left before it."""
@@ -102,16 +99,18 @@ def set_clock(monkeypatch: pytest.MonkeyPatch, clock: Callable[[], float]) -> No
 def connect_to(
     monkeypatch: pytest.MonkeyPatch, fake: FakeSocket | Exception
 ) -> list[tuple[Any, float]]:
-    """Make `create_connection` return `fake`, or raise it; log the calls."""
+    """Make `_open_connection` return `fake`, or raise it; log the calls."""
     calls: list[tuple[Any, float]] = []
 
-    def create_connection(address: Any, timeout: float) -> FakeSocket:
+    def open_connection(
+        address: Any, _deadline: float, timeout: float, _where: str
+    ) -> FakeSocket:
         calls.append((address, timeout))
         if isinstance(fake, Exception):
             raise fake
         return fake
 
-    monkeypatch.setattr(peer_transport, "create_connection", create_connection)
+    monkeypatch.setattr(peer_transport, "_open_connection", open_connection)
     return calls
 
 
@@ -193,7 +192,7 @@ def test_a_connection_that_cannot_be_made_is_a_fetch_error(
     """The reason is the OS's, and nothing is left open."""
     connect_to(monkeypatch, fake)
     transport = peer()
-    with pytest.raises(FetchError, match="no connection to peer.example:18444"):
+    with pytest.raises(FetchError, match=r"no connection to 'peer\.example':18444"):
         transport.send(MESSAGE, 5)
     assert not transport.is_open
 
@@ -206,10 +205,10 @@ def test_a_write_that_fails_closes_the_connection(
     working = FakeSocket([])
     sockets = iter([broken, working])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = peer()
-    with pytest.raises(FetchError, match="gone"):
+    with raises_alone(FetchError, match=r"no connection to 'peer\.example':18444"):
         transport.send(MESSAGE, 5)
     assert broken.closed == 1
     transport.send(MESSAGE, 5)
@@ -284,7 +283,7 @@ def test_a_peer_that_goes_quiet_is_a_fetch_error(
     connect_to(monkeypatch, fake)
     transport = peer()
     transport.send(MESSAGE, 5)
-    with pytest.raises(FetchError, match="no message from peer.example:18444"):
+    with pytest.raises(FetchError, match=r"no message from 'peer\.example':18444"):
         transport.receive(5)
     assert not transport.is_open
     assert fake.closed == 1
@@ -326,8 +325,8 @@ def test_a_message_announcing_too_much_is_refused_before_it_is_read(
     connect_to(monkeypatch, fake)
     transport = peer()
     transport.send(MESSAGE, 5)
-    with pytest.raises(
-        FetchError, match="invalid payload length: at most 4000000 bytes expected"
+    with raises_alone(
+        FetchError, match=r"'peer\.example':18444: a message that does not parse"
     ):
         transport.receive(5)
     assert not transport.is_open
@@ -341,9 +340,69 @@ def test_a_message_with_a_wrong_checksum_is_refused(
     connect_to(monkeypatch, FakeSocket([WIRE[:-1] + b"\x01"]))
     transport = peer()
     transport.send(MESSAGE, 5)
-    with pytest.raises(FetchError, match="invalid checksum"):
+    with raises_alone(
+        FetchError, match=r"'peer\.example':18444: a message that does not parse"
+    ):
         transport.receive(5)
     assert not transport.is_open
+
+
+@pytest.mark.parametrize("call", ["send", "receive"])
+def test_an_interrupt_closes_the_connection(
+    monkeypatch: pytest.MonkeyPatch, call: str
+) -> None:
+    """A message half written or half read leaves no connection open."""
+    # the header arrives and the payload does not, so a read is interrupted
+    fake = FakeSocket([WIRE[:24]], error=KeyboardInterrupt())
+    connect_to(monkeypatch, fake)
+    transport = peer()
+    transport.send(MESSAGE, 5)
+    if call == "send":
+        fake.send_error = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        getattr(transport, call)(*((MESSAGE, 5) if call == "send" else (5,)))
+    assert not transport.is_open
+    assert fake.closed == 1
+
+
+def interrupt_first_close(monkeypatch: pytest.MonkeyPatch, fake: FakeSocket) -> None:
+    """Interrupt the first close of `fake`, before it closes."""
+    close = fake.close
+    interrupted: list[bool] = []
+
+    def interrupted_close() -> None:
+        if not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        close()
+
+    monkeypatch.setattr(fake, "close", interrupted_close)
+
+
+@pytest.mark.parametrize("call", ["send", "receive"])
+def test_an_interrupt_of_the_close_after_an_interrupt_leaves_nothing_open(
+    monkeypatch: pytest.MonkeyPatch, call: str
+) -> None:
+    """The stream left mid-message is written to no more, and closed after."""
+    first = FakeSocket([WIRE[:24]], error=KeyboardInterrupt())
+    again = FakeSocket([])
+    sockets = iter([first, again])
+    monkeypatch.setattr(
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
+    )
+    transport = peer()
+    transport.send(MESSAGE, 5)
+    if call == "send":
+        first.send_error = KeyboardInterrupt()
+    interrupt_first_close(monkeypatch, first)
+    with pytest.raises(KeyboardInterrupt):
+        getattr(transport, call)(*((MESSAGE, 5) if call == "send" else (5,)))
+    assert (transport.is_open, first.closed) == (False, 0)
+    first.send_error = None
+    transport.send(MESSAGE, 5)
+    assert first.written == WIRE
+    assert first.closed == 1
+    assert again.written == WIRE
 
 
 # closing
@@ -382,7 +441,7 @@ def test_a_socket_that_fails_to_close_is_a_fetch_error(
     connect_to(monkeypatch, fake)
     transport = peer()
     transport.send(MESSAGE, 5)
-    with pytest.raises(FetchError, match="closing peer.example:18444: bad descriptor"):
+    with pytest.raises(FetchError, match=r"closing 'peer\.example':18444"):
         transport.close()
     assert not transport.is_open
     transport.close()
@@ -398,7 +457,7 @@ def test_a_failure_to_close_after_a_failed_write_reports_the_write(
     )
     connect_to(monkeypatch, fake)
     transport = peer()
-    with pytest.raises(FetchError, match="no connection to peer.example:18444: gone"):
+    with pytest.raises(FetchError, match=r"no connection to 'peer\.example':18444"):
         transport.send(MESSAGE, 5)
     assert fake.closed == 1
     assert not transport.is_open
@@ -616,26 +675,17 @@ def test_a_v2_message_for_another_network_is_refused(
 
 
 @pytest.mark.parametrize(
-    "fake, why",
+    "fake",
     [
-        (
-            lambda: V2Peer(garbage=b"\x5a" * 4095, terminator=bytes(16)),
-            "no garbage terminator",
-        ),
-        (
-            lambda: V2Peer(garbage=b"\x5a" * 4096),
-            "no garbage terminator",
-        ),
-        (lambda: V2Peer(garbage=b"\x5a", aad=b"\xa5"), "authentication failed"),
-        (
-            lambda: V2Peer(garbage=b"\x5a", aad=b"\xa5", decoys=1),
-            "authentication failed",
-        ),
+        lambda: V2Peer(garbage=b"\x5a" * 4095, terminator=bytes(16)),
+        lambda: V2Peer(garbage=b"\x5a" * 4096),
+        lambda: V2Peer(garbage=b"\x5a", aad=b"\xa5"),
+        lambda: V2Peer(garbage=b"\x5a", aad=b"\xa5", decoys=1),
     ],
     ids=["wrong terminator", "garbage too long", "garbage altered", "decoy altered"],
 )
 def test_a_failed_v2_handshake_is_a_fetch_error(
-    monkeypatch: pytest.MonkeyPatch, fake: Callable[[], V2Peer], why: str
+    monkeypatch: pytest.MonkeyPatch, fake: Callable[[], V2Peer]
 ) -> None:
     """No terminator after the most garbage a peer may send is refused.
 
@@ -646,7 +696,7 @@ def test_a_failed_v2_handshake_is_a_fetch_error(
     peer_socket = fake()
     connect_to(monkeypatch, peer_socket)
     transport = v2_peer()
-    with pytest.raises(FetchError, match=why):
+    with raises_alone(FetchError, match=r"^'peer\.example':18444: "):
         transport.send(MESSAGE, 5)
     assert not transport.is_open
     assert transport.session_id is None
@@ -693,7 +743,7 @@ def test_a_v1_peer_is_spoken_to_over_v1_with_the_fallback(
     refusing, plain, again = FakeSocket([]), FakeSocket([WIRE]), V2Peer()
     sockets = iter([refusing, plain, again])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = v2_peer(v1_fallback=True)
     transport.send(MESSAGE, 5)
@@ -717,7 +767,7 @@ def test_a_v1_fallback_refuses_a_message_for_another_network(
     refusing, plain = FakeSocket([]), FakeSocket([])
     sockets = iter([refusing, plain])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = v2_peer(v1_fallback=True)
     transport.send(MESSAGE, 5)
@@ -740,7 +790,7 @@ def test_an_interrupted_v2_handshake_leaves_nothing_open(
     again = V2Peer()
     sockets = iter([interrupted, again])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = v2_peer()
     with pytest.raises(KeyboardInterrupt):
@@ -766,13 +816,13 @@ def test_an_interrupted_v1_fallback_leaves_nothing_open(
         again,
     ]
 
-    def create_connection(*_args: object, **_kwargs: object) -> FakeSocket:
+    def open_connection(*_args: object, **_kwargs: object) -> FakeSocket:
         outcome = outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(peer_transport, "create_connection", create_connection)
+    monkeypatch.setattr(peer_transport, "_open_connection", open_connection)
     transport = v2_peer(v1_fallback=True)
     with pytest.raises(KeyboardInterrupt):
         transport.send(MESSAGE, 5)
@@ -790,7 +840,7 @@ def test_an_interrupted_v1_write_closes_the_transport(
     refusing, plain = FakeSocket([]), FakeSocket([])
     sockets = iter([refusing, plain])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = v2_peer(v1_fallback=True)
     transport.send(MESSAGE, 5)
@@ -827,7 +877,7 @@ def test_a_failed_v1_connection_closes_the_transport(
     refusing, plain, again = FakeSocket([]), FakeSocket([WIRE[:10]]), V2Peer()
     sockets = iter([refusing, plain, again])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = v2_peer(v1_fallback=True)
     transport.send(MESSAGE, 5)
@@ -878,7 +928,7 @@ def test_an_interrupt_as_the_v1_fallback_is_kept_closes_it(
     refusing, plain = FakeSocket([]), FakeSocket([])
     sockets = iter([refusing, plain])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = interrupted_when_kept("_v1", v1_fallback=True)
     with pytest.raises(KeyboardInterrupt):
@@ -905,7 +955,7 @@ def opened(
         fake = FakeSocket([])
         sockets = iter([FakeSocket([]), fake])
         monkeypatch.setattr(
-            peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+            peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
         )
         transport = v2_peer(v1_fallback=True)
     transport.send(MESSAGE, 5)
@@ -916,21 +966,13 @@ def opened(
 def test_an_interrupted_close_leaves_the_socket_to_the_next_close(
     monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """A socket is let go of only once closed."""
+    """A socket is let go of only once closed, and is not open meanwhile."""
     transport, fake = opened(monkeypatch, kind)
-    close = fake.close
-    interrupted: list[bool] = []
-
-    def interrupted_close() -> None:
-        if not interrupted:
-            interrupted.append(True)
-            raise KeyboardInterrupt
-        close()
-
-    monkeypatch.setattr(fake, "close", interrupted_close)
+    interrupt_first_close(monkeypatch, fake)
     with pytest.raises(KeyboardInterrupt):
         transport.close()
     assert fake.closed == 0
+    assert not transport.is_open
     transport.close()
     assert fake.closed == 1
     assert not transport.is_open
@@ -962,7 +1004,7 @@ def test_a_send_after_a_close_interrupted_once_the_socket_closed_reconnects(
     closed, again = FakeSocket([]), FakeSocket([])
     sockets = iter([closed, again])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = peer()
     transport.send(MESSAGE, 5)
@@ -970,7 +1012,8 @@ def test_a_send_after_a_close_interrupted_once_the_socket_closed_reconnects(
 
     def closed_then_interrupted() -> None:
         close()
-        raise KeyboardInterrupt
+        if closed.closed == 1:
+            raise KeyboardInterrupt
 
     monkeypatch.setattr(closed, "close", closed_then_interrupted)
     with pytest.raises(KeyboardInterrupt):
@@ -988,7 +1031,7 @@ def test_a_v1_fallback_that_closed_itself_is_not_used_again(
     plain, again = FakeSocket([WIRE[:10]]), V2Peer()
     sockets = iter([FakeSocket([]), plain, again])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = v2_peer(v1_fallback=True)
     transport.send(MESSAGE, 5)
@@ -1020,11 +1063,11 @@ def test_a_v1_fallback_that_fails_to_close_is_a_fetch_error(
     plain = FakeSocket([], close_error=OSError("bad descriptor"))
     sockets = iter([FakeSocket([]), plain])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = v2_peer(v1_fallback=True)
     transport.send(MESSAGE, 5)
-    with pytest.raises(FetchError, match="closing peer.example:18444: bad descriptor"):
+    with pytest.raises(FetchError, match=r"closing 'peer\.example':18444"):
         transport.close()
     assert not transport.is_open
     transport.close()
@@ -1067,7 +1110,7 @@ def test_a_hang_up_while_the_key_is_written_falls_back_to_v1(
     refusing, plain = HangingUp(24, hang_up), FakeSocket([])
     sockets = iter([refusing, plain])
     monkeypatch.setattr(
-        peer_transport, "create_connection", lambda *_a, **_k: next(sockets)
+        peer_transport, "_open_connection", lambda *_a, **_k: next(sockets)
     )
     transport = v2_peer(v1_fallback=True)
     transport.send(MESSAGE, 5)
@@ -1097,7 +1140,7 @@ def test_a_hang_up_before_a_v1_header_is_written_is_a_failure(
     fake = HangingUp(23, ConnectionResetError("reset"))
     calls = connect_to(monkeypatch, fake)
     transport = v2_peer(v1_fallback=True)
-    with pytest.raises(FetchError, match="no connection to peer.example:18444: reset"):
+    with pytest.raises(FetchError, match=r"no connection to 'peer\.example':18444"):
         transport.send(MESSAGE, 5)
     assert (len(calls), fake.closed) == (1, 1)
 
@@ -1109,7 +1152,7 @@ def test_a_v2_connection_that_cannot_be_made_is_a_fetch_error(
     pytest.importorskip("cryptography.hazmat.primitives.ciphers.aead")
     connect_to(monkeypatch, OSError("unreachable"))
     transport = v2_peer()
-    with pytest.raises(FetchError, match="no connection to peer.example:18444"):
+    with pytest.raises(FetchError, match=r"no connection to 'peer\.example':18444"):
         transport.send(MESSAGE, 5)
     assert not transport.is_open
 
@@ -1121,7 +1164,7 @@ def test_a_v2_write_that_fails_closes_the_connection(
     fake = V2Peer(send_error=BrokenPipeError("gone"))
     connect_to(monkeypatch, fake)
     transport = v2_peer()
-    with pytest.raises(FetchError, match="no connection to peer.example:18444: gone"):
+    with pytest.raises(FetchError, match=r"no connection to 'peer\.example':18444"):
         transport.send(MESSAGE, 5)
     assert fake.closed == 1
     assert not transport.is_open
@@ -1155,7 +1198,7 @@ def test_a_v2_peer_that_goes_quiet_is_a_fetch_error(
     connect_to(monkeypatch, fake)
     transport = v2_peer()
     transport.send(MESSAGE, 5)
-    with pytest.raises(FetchError, match="no message from peer.example:18444"):
+    with pytest.raises(FetchError, match=r"no message from 'peer\.example':18444"):
         transport.receive(5)
     assert not transport.is_open
 
@@ -1176,17 +1219,17 @@ def test_a_v2_packet_announcing_too_much_is_refused_before_it_is_read(
 
 
 @pytest.mark.parametrize(
-    "tamper, why",
+    "tamper, bounded",
     [
-        (lambda packet: packet[:-1] + bytes([packet[-1] ^ 1]), "authentication"),
-        (lambda packet: packet, "invalid payload length"),
+        (lambda packet: packet[:-1] + bytes([packet[-1] ^ 1]), False),
+        (lambda packet: packet, True),
     ],
     ids=["tag", "payload too long"],
 )
 def test_a_v2_packet_refused_closes_the_connection(
     monkeypatch: pytest.MonkeyPatch,
     tamper: Callable[[bytes], bytes],
-    why: str,
+    bounded: bool,
 ) -> None:
     """A tag that fails, and a message the codec refuses, end the stream."""
     fake = V2Peer(packets=lambda peer: [tamper(peer.packet("ping", bytes(8)))])
@@ -1194,9 +1237,9 @@ def test_a_v2_packet_refused_closes_the_connection(
     transport = v2_peer()
     transport.send(MESSAGE, 5)
     # a payload bound below a ping's, so that the codec refuses it
-    if why != "authentication":
+    if bounded:
         monkeypatch.setattr(message_module, "MAX_PROTOCOL_MESSAGE_LENGTH", 4)
-    with pytest.raises(FetchError, match=why):
+    with raises_alone(FetchError, match=r"^'peer\.example':18444: BTClibValueError$"):
         transport.receive(5)
     assert not transport.is_open
 
@@ -1217,6 +1260,6 @@ def test_v2_close_is_idempotent_and_the_context_closes(
     failing.close_error = OSError("bad descriptor")
     connect_to(monkeypatch, failing)
     transport.send(MESSAGE, 5)
-    with pytest.raises(FetchError, match="closing peer.example:18444: bad descriptor"):
+    with pytest.raises(FetchError, match=r"closing 'peer\.example':18444"):
         transport.close()
     assert not transport.is_open

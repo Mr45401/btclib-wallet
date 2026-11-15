@@ -37,9 +37,11 @@ from typing import TypeVar
 from btclib.alias import Octets
 from btclib.block.block_header import BlockHeader
 from btclib.exceptions import BTClibValueError
+from btclib.network import NETWORKS
 from btclib.tx import Tx
 from typing_extensions import override
 
+from btclib_wallet._refusal import _label
 from btclib_wallet.exceptions import FetchError
 from btclib_wallet.fetch.fetcher import Fetcher, tx_id_hex
 
@@ -187,9 +189,12 @@ class FallbackFetcher(Fetcher):
     next one.
 
     When every backend raises, this raises a `FetchError` naming each of
-    them and its failure, chained (`raise ... from`) off the last one --
-    not the last one's message alone, which would report a second-string
-    backend's 404 for what began as the primary's dead socket.
+    them and the class of its failure -- not the last one's message alone,
+    which would report a second-string backend's 404 for what began as the
+    primary's dead socket. It relays no backend's text and chains no
+    backend's exception, as cause or as context: a `Fetcher` of the
+    caller's own may raise a `FetchError` holding anything (section 7 of
+    the btclib-org standard, *A refusal carries no secret*).
 
     **This never compares two answers.** It stops at the first backend
     that does not raise, so on the disagreement two backends could have
@@ -215,7 +220,9 @@ class FallbackFetcher(Fetcher):
             raise BTClibValueError("no backends given")
         networks = {fetcher.network for fetcher in fetchers}
         if len(networks) > 1:
-            err_msg = f"mismatched networks: {sorted(networks)}"
+            err_msg = "mismatched networks: " + ", ".join(
+                _label(network, NETWORKS) for network in sorted(networks)
+            )
             raise BTClibValueError(err_msg)
         super().__init__(fetchers[0].network)
         self.fetchers = tuple(fetchers)
@@ -223,17 +230,15 @@ class FallbackFetcher(Fetcher):
     def _first_answer(self, description: str, call: Callable[[Fetcher], _T]) -> _T:
         """Try each backend in order, falling through `FetchError` alone."""
         failures: list[str] = []
-        exceptions: list[FetchError] = []
         for fetcher in self.fetchers:
             try:
                 return call(fetcher)
             except FetchError as e:
-                failures.append(f"{type(fetcher).__name__}: {e}")
-                exceptions.append(e)
+                failures.append(f"{type(fetcher).__name__}: {type(e).__name__}")
+        # raised after the loop, outside every `except` block, so that it
+        # chains no backend's exception, whose text can be anything
         err_msg = f"{description}: every backend failed -- " + "; ".join(failures)
-        # `self.fetchers` is non-empty by construction, so the loop above
-        # ran at least once and `exceptions` holds the last backend's error
-        raise FetchError(err_msg) from exceptions[-1]
+        raise FetchError(err_msg)
 
     @override
     def get_tx(self, tx_id: Octets) -> Tx:

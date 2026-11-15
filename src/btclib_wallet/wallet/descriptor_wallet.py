@@ -24,6 +24,9 @@ ways in put the labels there:
 - `from_account`, which is `bip44.account_descriptors`: an account xpub
   and its master fingerprint in, the receive and change descriptors out.
 
+A label is an integer from 0 to 2**63 - 1, the top being the largest
+SQLite INTEGER a `Ledger` writes it into.
+
 What this adds to a descriptor is the branch, the record of what has been
 handed out, and `position_of`; what it delegates is everything else, and
 `descriptor(branch)` hands back the `Descriptor` for the questions this
@@ -59,6 +62,10 @@ xprv to its xpub -- so a wallet is watch-only unless it is handed the
 walk, keyed as it keys them. That mapping is also the whole of what
 `is_watch_only` reads, there being nothing else here that could sign.
 
+A WIF key expression is refused, a ``musig()`` participant included,
+whichever way the descriptor comes in: `descriptors.parse` keeps only its
+public key, so the wallet would be watch-only for it without saying so.
+
 BIP380: https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki
 BIP389: https://github.com/bitcoin/bips/blob/master/bip-0389.mediawiki
 """
@@ -69,11 +76,13 @@ from collections.abc import Mapping, Sequence
 
 from btclib.alias import Octets
 from btclib.exceptions import BTClibTypeError, BTClibValueError
+from btclib.network import NETWORKS
 from btclib.script.script_pub_key import ScriptPubKey
 from btclib.script.witness import Witness
 from btclib.utils import assert_type
 from typing_extensions import override
 
+from btclib_wallet._refusal import _exact_int, _label, _quoted
 from btclib_wallet.bip32.bip32 import BIP32Key
 from btclib_wallet.bip32.der_path import DerPath
 from btclib_wallet.bip44 import BIP44ScriptType, account_descriptors
@@ -96,6 +105,23 @@ __all__ = [
 ]
 
 
+def _assert_no_wif(descriptor: Descriptor) -> None:
+    """Refuse a WIF key expression, a ``musig()`` participant included.
+
+    The message names no key: a WIF is a private key.
+    """
+    keys = list(descriptor.key_expressions)
+    while keys:
+        key = keys.pop()
+        if key.wif_prefix:
+            err_msg = (
+                "a WIF key expression is not supported: the wallet would"
+                " keep only its public key, and could not sign for it"
+            )
+            raise BTClibValueError(err_msg)
+        keys.extend(key.participants)
+
+
 def _assert_distinct(
     by_branch: Mapping[int, Descriptor], prv_keys: PrvKeys | None
 ) -> None:
@@ -115,9 +141,39 @@ def _assert_distinct(
                 found = ranged.index_of(first[fixed], _LAST_INDEX, prv_keys)
                 shared = found is not None
             if shared:
-                err_msg = f"branches {branch_a} and {branch_b} share a script:"
+                err_msg = f"branches {_quoted(branch_a)} and {_quoted(branch_b)} share a script:"
                 err_msg += " position_of could not tell them apart"
                 raise BTClibValueError(err_msg)
+
+
+def _labels(by_branch: Mapping[int, Descriptor]) -> dict[int, Descriptor]:
+    """Refuse a label that is no integer, or is outside 0 to 2**63 - 1.
+
+    The module docstring says why. No value refusal prints the value: an
+    int past the interpreter's digit limit has no str(). The type decides
+    whether a label is an int, as `_quoted` says, since a `__class__` can
+    claim one or raise. Each label is kept as the exact int `_exact_int`
+    reads: the str() of an IntEnum can be its name, which a ledger would
+    write and could not read back, and a subclass's `__int__` can answer
+    another number. Two labels holding one int are refused, since one
+    descriptor would replace the other.
+    """
+    labels: dict[int, Descriptor] = {}
+    for branch, descriptor in by_branch.items():
+        # a caller can hand any key, whatever the annotation says
+        kind: type[object] = type(branch)
+        if not issubclass(kind, int) or kind is bool:
+            err_msg = f"invalid branch type: {kind.__name__}"
+            raise BTClibTypeError(err_msg)
+        value = _exact_int(branch)
+        if value < 0:
+            raise BTClibValueError("invalid branch: negative")
+        if value >= 2**63:
+            raise BTClibValueError("invalid branch: not below 2**63")
+        if value in labels:
+            raise BTClibValueError("invalid branch: two labels hold one int")
+        labels[value] = descriptor
+    return labels
 
 
 class DescriptorWallet(RangedWallet):
@@ -150,12 +206,12 @@ class DescriptorWallet(RangedWallet):
         if not by_branch:
             err_msg = "no descriptor: a wallet has at least one chain"
             raise BTClibValueError(err_msg)
+        by_branch = _labels(by_branch)
 
         for branch, descriptor in by_branch.items():
-            if branch < 0:
-                raise BTClibValueError(f"invalid branch: {branch}")
+            _assert_no_wif(descriptor)
             if isinstance(descriptor, ComboDescriptor):
-                err_msg = f"combo() at branch {branch}: four scripts at one"
+                err_msg = f"combo() at branch {_quoted(branch)}: four scripts at one"
                 err_msg += " index are four addresses at one position, so a"
                 err_msg += " wallet cannot hold one -- Descriptor"
                 err_msg += ".script_pub_keys is what answers for it"
@@ -163,7 +219,9 @@ class DescriptorWallet(RangedWallet):
 
         networks = {descriptor.network for descriptor in by_branch.values()}
         if len(networks) != 1:
-            err_msg = f"descriptors of different networks: {sorted(networks)}"
+            err_msg = "descriptors of different networks: " + ", ".join(
+                _label(network, NETWORKS) for network in sorted(networks)
+            )
             raise BTClibValueError(err_msg)
 
         _assert_distinct(by_branch, prv_keys)
@@ -193,6 +251,8 @@ class DescriptorWallet(RangedWallet):
         branch is read in `network`. A descriptor with no such step is one
         chain, and a wallet of one branch -- which is what a caller watching
         a single chain has, and not an error.
+
+        A WIF key expression is refused, as the module docstring says.
         """
         return cls(
             [

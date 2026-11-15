@@ -25,9 +25,12 @@ tree in their place.
 
 from __future__ import annotations
 
+import secrets
+
 import pytest
+from btclib.b58 import wif_from_prv_key
 from btclib.exceptions import BTClibTypeError, BTClibValueError
-from btclib.key import PubKeyData
+from btclib.key import PrvKeyData, PubKeyData
 from btclib.script import script
 from btclib.script.script_pub_key import ScriptPubKey
 from btclib.tx.out_point import OutPoint
@@ -46,6 +49,7 @@ from btclib_wallet.descriptors import (
 )
 from btclib_wallet.psbt.psbt import Psbt
 from btclib_wallet.wallet import BIP32KeyWallet, DescriptorWallet
+from tests.secret_free import assert_secret_free
 
 # the "abandon abandon ... about" seed and its BIP84 account, which is the
 # account every other wallet test uses too
@@ -149,16 +153,16 @@ def test_a_wallet_has_at_least_one_chain() -> None:
 
 
 def test_a_branch_is_a_label_and_labels_are_not_negative() -> None:
-    """The one thing a chain label has to be, `position_of` walking them."""
-    with pytest.raises(BTClibValueError, match="invalid branch: -1"):
-        DescriptorWallet({-1: parse(_descriptor(f"wpkh({_XPUB}/0/*)"))})
+    """A negative label is refused, `position_of` walking labels in order."""
+    with pytest.raises(BTClibValueError, match="invalid branch: negative"):
+        DescriptorWallet({-(10**5000): parse(_descriptor(f"wpkh({_XPUB}/0/*)"))})
 
 
 def test_the_chains_must_be_of_one_network() -> None:
     """A wallet is on a chain, and a network is what a chain is."""
     mainnet = parse(_descriptor(f"wpkh({_XPUB}/0/*)"))
     testnet = parse(_descriptor(f"wpkh({_TPUB}/1/*)"), "testnet")
-    err_msg = r"descriptors of different networks: \['mainnet', 'testnet'\]"
+    err_msg = "descriptors of different networks: mainnet, testnet"
     with pytest.raises(BTClibValueError, match=err_msg):
         DescriptorWallet([mainnet, testnet])
 
@@ -248,6 +252,49 @@ def test_a_combo_is_four_addresses_at_one_position() -> None:
     combo = parse(_descriptor(f"combo({_XPUB}/0/*)"))
     with pytest.raises(BTClibValueError, match="combo\\(\\) at branch 0"):
         DescriptorWallet([combo])
+
+
+def _random_prv_key() -> PrvKeyData:
+    """Return a random compressed regtest key, never one a test spells out."""
+    return PrvKeyData(secrets.randbelow(2**255) + 1, "regtest", compressed=True)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "wpkh({wif})",
+        "combo({wif})",
+        "wsh(multi(1,{other},{wif}))",
+        "tr(musig({wif},{other}))",
+    ],
+)
+@pytest.mark.parametrize("from_text", [True, False])
+def test_a_wif_is_refused_by_name(expression: str, from_text: bool) -> None:
+    """The refusal names the WIF key expression and shows nothing of the key.
+
+    The module docstring of `btclib_wallet.wallet.descriptor_wallet` says
+    why a WIF is refused. The message shows neither the WIF, nor the
+    scalar in hex or decimal, nor the public key.
+    """
+    prv_key = _random_prv_key()
+    wif = wif_from_prv_key(prv_key.q, prv_key.network, prv_key.compressed)
+    other = _random_prv_key().pub.sec.hex()
+    text = _descriptor(expression.format(wif=wif, other=other))
+    with pytest.raises(BTClibValueError, match="^a WIF key expression") as caught:
+        if from_text:
+            DescriptorWallet.from_descriptor(text, "regtest")
+        else:
+            DescriptorWallet(parse(text, "regtest", {}))
+    assert_secret_free(
+        caught.value,
+        [
+            wif,
+            prv_key.q.to_bytes(32, "big"),
+            f"{prv_key.q:x}",
+            str(prv_key.q),
+            prv_key.pub.sec,
+        ],
+    )
 
 
 def test_a_script_with_no_address_is_not_handed_out() -> None:
@@ -401,7 +448,10 @@ def test_the_updaters_take_a_position_where_a_descriptor_takes_an_index() -> Non
     assert paid.outputs[0].redeem_script == wallet.redeem_script(1, 2)
     # the output half refuses unless the output being paid is the very
     # script the position derives, which is `position_of` as a claim
-    with pytest.raises(BTClibValueError, match="which is not the script"):
+    with pytest.raises(
+        BTClibValueError,
+        match="output 0 pays to another script than the one this descriptor describes at index 3",
+    ):
         wallet.update_psbt_output(psbt, 0, 1, 3)
     for method in (wallet.update_psbt_input, wallet.update_psbt_output):
         with pytest.raises(BTClibValueError, match="invalid branch: 2"):

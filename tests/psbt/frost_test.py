@@ -568,7 +568,10 @@ def test_two_writers_that_disagree_are_refused() -> None:
         (
             record_key_data(7),
             counts + pair[1] + pair[2],
-            "frost threshold info of participant 7, who is not one of the 3",
+            (
+                "frost threshold info of participant 7, who is not one of the"
+                " participants the record declares: 3"
+            ),
         ),
     ):
         broken = _broken(psbt, THRESHOLD_INFO, key_data, value)
@@ -639,7 +642,7 @@ def test_the_updater_files_key_material_it_has_checked() -> None:
             psbt_frost.add_threshold_info(psbt.inputs[0], my_id, info)
 
     psbt.inputs[0].unknown = {}
-    err_msg = "no frost threshold info for threshold public key"
+    err_msg = "no frost threshold info for the threshold public key"
     with pytest.raises(BTClibValueError, match=err_msg):
         psbt_frost.threshold_info(psbt.inputs[0], THRESH_PK)
 
@@ -760,7 +763,10 @@ def test_a_leaf_the_spent_output_does_not_commit_to() -> None:
     cases = (
         (wrapped, "the input spends no taproot output"),
         (p2wpkh, "the input spends no taproot output"),
-        (unproven, "the control block does not prove leaf script"),
+        (
+            unproven,
+            "a control block does not prove its leaf script against the output key",
+        ),
     )
     for refused, err_msg in cases:
         with pytest.raises(BTClibValueError, match=err_msg):
@@ -778,7 +784,8 @@ def test_a_round_that_the_other_round_has_not_reached() -> None:
     # no nonce at all: there is no session to build a context of
     psbt = internal_key_psbt()
     with pytest.raises(
-        BTClibValueError, match="no frost public nonce for threshold public key"
+        BTClibValueError,
+        match="no frost public nonce for the threshold public key",
     ):
         psbt_frost.session_context(psbt, 0, THRESH_PK)
 
@@ -864,7 +871,10 @@ def test_a_session_signs_another_sig_hash_type_only_if_allowed() -> None:
         for my_id in SIGNERS
     }
     my_id = SIGNERS[0]
-    with pytest.raises(BTClibValueError, match="asks for sig_hash type 0x2"):
+    with pytest.raises(
+        BTClibValueError,
+        match="input 0 asks for sig_hash type 0x2, which allowed_sig_hash_types does not name",
+    ):
         psbt_frost.partial_sign(
             psbt, 0, sec_nonces[my_id], my_id, SEC_SHARES[my_id], THRESH_PK
         )

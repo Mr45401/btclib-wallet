@@ -39,12 +39,14 @@ from btclib_wallet.ledger import (
     TxDetail,
     TxState,
 )
-from btclib_wallet.ledger.ledger import _SYNC_ATTEMPTS, _parents_first
+from btclib_wallet.ledger.ledger import _KEEP_SPAN, _SYNC_ATTEMPTS, _parents_first
 from btclib_wallet.psbt.psbt import Psbt, extract_tx, finalize
 from btclib_wallet.psbt_signer import SoftwareSigner
 from btclib_wallet.wallet import DescriptorWallet
 from tests.ledger.conftest import LOOKAHEAD as SMALL_LOOKAHEAD
 from tests.ledger.conftest import XPRV, FakeChain, script_of, source, tampered
+from tests.refused_value_test import HEX, SPELLINGS
+from tests.secret_free import assert_secret_free
 
 
 def _state(ledger: Ledger, tx: Tx) -> TxState:
@@ -163,6 +165,27 @@ def test_a_branch_that_is_not_ranged_has_one_address(
     assert ledger.new_address(source_id) == address
 
 
+def test_the_highest_branch_is_the_highest_the_file_holds(
+    ledger: Ledger, chain: FakeChain, path: Path
+) -> None:
+    """2**63 - 1, an SQLite INTEGER's largest, handed out and read back.
+
+    The wallet refuses 2**63 when it is built, before any ledger sees it.
+    """
+    top = 2**63 - 1
+    prv_keys: dict[str, str] = {}
+    descriptor = parse(f"wpkh({XPRV}/84h/1h/6h/0/*)", "regtest", prv_keys)
+    with pytest.raises(BTClibValueError, match=r"invalid branch: not below 2\*\*63"):
+        DescriptorWallet({top + 1: descriptor}, prv_keys)
+    wallet = DescriptorWallet({top: descriptor}, prv_keys)
+    source_id = ledger.add_source(wallet, lookahead=SMALL_LOOKAHEAD)
+    assert ledger.new_address(source_id, top) == wallet.address(top, 0)
+    ledger.close()
+    with Ledger.load(path, "regtest", chain) as loaded:
+        assert loaded.sources[source_id].branches == (top,)
+        assert loaded.new_address(source_id, top) == wallet.address(top, 1)
+
+
 def test_a_source_added_later_owns_what_is_held(
     ledger: Ledger, chain: FakeChain
 ) -> None:
@@ -237,8 +260,20 @@ def test_a_source_is_checked(ledger: Ledger) -> None:
         ledger.add_source(source(), lookahead=-1)
     xpub = SoftwareSigner(XPRV).xpub("m/84h/1h/0h")
     wallet = DescriptorWallet(parse(f"wpkh({xpub}/0/*)", "testnet"))
-    with pytest.raises(BTClibValueError, match="a testnet wallet in a regtest ledger"):
+    with pytest.raises(
+        BTClibValueError,
+        match="^the wallet's network, testnet, is not the ledger's, regtest$",
+    ):
         ledger.add_source(wallet)
+    # a network written after the wallet checked it is told by its length,
+    # with no article before it (issue #821)
+    wallet.network = HEX
+    err_msg = (
+        "^the wallet's network, a value of 64 characters, is not the ledger's, regtest$"
+    )
+    with pytest.raises(BTClibValueError, match=err_msg) as e:
+        ledger.add_source(wallet)
+    assert_secret_free(e.value, SPELLINGS)
     with pytest.raises(BTClibTypeError, match="invalid branch type: str"):
         ledger.new_address(0, "0")  # type: ignore[arg-type]
 
@@ -487,6 +522,102 @@ def test_a_reorganization_below_every_block_held(
     result = ledger.sync()
     assert result.fork_height == -1
     assert result.tip == chain.tip
+
+
+def _synced_each_block(ledger: Ledger, chain: FakeChain, tip: int) -> Tx:
+    """Sync at 0, confirm a payment at 1, then sync at each block to `tip`."""
+    ledger.sync()
+    payment = _funded(ledger, chain)
+    while chain.tip.height < tip:
+        chain.mine()
+        ledger.sync()
+    return payment
+
+
+def test_the_blocks_held_grow_with_the_chain_not_with_the_syncs(
+    ledger: Ledger, chain: FakeChain, path: Path
+) -> None:
+    """The file keeps the blocks *The blocks held* names, and no other.
+
+    A walk down from a tip no longer on the chain asks from each block
+    held below it, so its reads list them.
+    """
+    tip = 2 * _KEEP_SPAN + 100
+    _synced_each_block(ledger, chain, tip)
+    ledger.close()
+    loaded = Ledger.load(path, "regtest", chain)
+    chain.blocks = [(b"\x07" * 32, [])]
+    chain.mine(count=tip + 1)
+    chain.reads.clear()
+    with loaded:
+        assert loaded.sync().fork_height == -1
+    near = list(range(tip - 1, tip - _KEEP_SPAN, -1))
+    # the lowest of the second span, the payment's block, the lowest of
+    # the first span, and then height 0 once nothing held is on the chain
+    assert chain.reads == [tip, *near, _KEEP_SPAN, 1, 0, 0]
+
+
+@pytest.mark.parametrize(
+    "fork, found",
+    [(10, 10), (9, 1)],
+    ids=["the-lowest-block-near-the-tip", "below-it"],
+)
+def test_a_reorganization_at_the_deepest_block_kept_near_the_tip(
+    ledger: Ledger, chain: FakeChain, fork: int, found: int
+) -> None:
+    """A fork at the lowest block near the tip is found there.
+
+    One block lower, it is found at the next block held, the payment's,
+    which stays where it is.
+    """
+    # the lowest block near the tip is at height 10
+    tip = _KEEP_SPAN + 9
+    payment = _synced_each_block(ledger, chain, tip)
+    chain.invalidate(fork + 1)
+    chain.mine(count=tip - fork + 1)
+    result = ledger.sync()
+    assert result.fork_height == found
+    assert payment.id not in result.changed
+    assert ledger.transaction(payment.id).wallet_tx.block == BlockRef(
+        1, chain.blocks[1][0]
+    )
+
+
+def test_a_backend_that_pruned_the_block_held_fails_each_sync(
+    ledger: Ledger, chain: FakeChain, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fork below the blocks near the tip reads from the next block held.
+
+    `BitcoinCoreFetcher` raises `FetchError` on a block a pruned node no
+    longer has. Where that block is the one held, the sync fails before
+    it writes anything, so the next sync walks down to it again and fails
+    too. A span of 4 keeps 9 to 12 near the tip 12, and 8, 4 and 0 below.
+    """
+    monkeypatch.setattr("btclib_wallet.ledger.ledger._KEEP_SPAN", 4)
+    ledger.sync()
+    while chain.tip.height < 12:
+        chain.mine()
+        ledger.sync()
+    tip = ledger.tip
+    read = chain.get_history
+
+    def pruned(
+        scripts: Iterable[Octets | ScriptPubKey], start_height: int = 0
+    ) -> ScriptHistory:
+        if start_height < 5:
+            raise FetchError("the node pruned the block")
+        return read(scripts, start_height)
+
+    monkeypatch.setattr(chain, "get_history", pruned)
+    # the fork is at 6, which the node still has
+    chain.invalidate(7)
+    chain.mine(count=8)
+    for _ in range(2):
+        chain.reads.clear()
+        with pytest.raises(FetchError, match="pruned"):
+            ledger.sync()
+        assert chain.reads == [12, 11, 10, 9, 8]
+        assert ledger.tip == tip
 
 
 def test_a_coinbase_matures_after_100_blocks(ledger: Ledger, chain: FakeChain) -> None:
@@ -944,6 +1075,34 @@ def test_a_sync_reads_again_where_the_tip_moved(
         ledger.sync()
     # the main read and the new source's read, at every attempt
     assert calls == 2 * _SYNC_ATTEMPTS
+
+
+@pytest.mark.parametrize("height", [True, 5.0, -1])
+def test_a_sync_refuses_a_tip_at_no_height(
+    chain: FakeChain, path: Path, height: object
+) -> None:
+    """Refused as a FetchError, with nothing written (issue #901)."""
+    with Ledger.create(path, "regtest", chain) as ledger:
+        ledger.add_source(source(), lookahead=SMALL_LOOKAHEAD)
+        ledger.sync()
+        synced = ledger.tip
+        chain.mine()
+        original = chain.get_history
+
+        def at_no_height(
+            scripts: Iterable[Octets | ScriptPubKey], start_height: int = 0
+        ) -> ScriptHistory:
+            answer = original(scripts, start_height)
+            tip = BlockRef(height, answer.tip.block_id)  # type: ignore[arg-type]
+            return ScriptHistory(answer.start, tip, answer.txs)
+
+        chain.get_history = at_no_height  # type: ignore[method-assign]
+        with pytest.raises(FetchError, match="^get_history: a malformed answer$") as e:
+            ledger.sync()
+        assert e.value.__context__ is None
+        assert ledger.tip == synced
+    with Ledger.load(path, "regtest", chain) as loaded:
+        assert loaded.tip == synced
 
 
 def test_a_taproot_spend_beside_an_output_not_held_is_kept_out(

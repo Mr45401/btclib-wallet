@@ -57,12 +57,21 @@ OTHER_ID = "b1fea52486ce0c62bb442b530a3f0132b826c74e473d1f2c220bfa78111c5082"
     ],
 )
 def test_fetch_errors_names_the_source(error: Exception) -> None:
-    """Wrap parse-time exceptions in a FetchError naming the call."""
+    """Wrap parse-time exceptions in a FetchError naming the call.
+
+    A builtin's text can hold the answer it refused, and so can btclib's,
+    so neither is relayed nor chained (issue #821): a builtin's type is
+    named.
+    """
     with (
-        pytest.raises(FetchError, match=f"getblockcount: {error}"),
+        pytest.raises(FetchError, match="^'getblockcount': a malformed answer") as e,
         fetch_errors("getblockcount"),
     ):
         raise error
+    if not isinstance(error, BTClibRuntimeError):
+        assert str(e.value).endswith(f", as {type(error).__name__}")
+    assert e.value.__cause__ is None
+    assert e.value.__context__ is None
 
 
 def test_fetch_errors_lets_a_fetch_error_through() -> None:
@@ -81,6 +90,11 @@ def test_fetch_errors_is_transparent_when_nothing_is_raised() -> None:
     assert value == 481824
 
 
+# what `client_errors` answers for any rpc error, the client's text not
+# relayed
+_AN_RPC_ERROR = r"^the server answered an rpc error \(rpc error code {}\)$"
+
+
 def test_client_errors_raises_this_packages_rpc_error_with_the_code() -> None:
     """The client's `RpcError` leaves as this package's, its code kept.
 
@@ -88,8 +102,13 @@ def test_client_errors_raises_this_packages_rpc_error_with_the_code() -> None:
     attributes of the release installed.
     """
     error = rpc.RpcError("sendrawtransaction: the node answered an error", -26)
-    with pytest.raises(RpcError) as exc, client_errors():
+    with (
+        pytest.raises(RpcError, match=_AN_RPC_ERROR.format(-26)) as exc,
+        client_errors(),
+    ):
         raise error
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
     assert exc.value.code == -26
     assert exc.value.data is None
     assert not isinstance(exc.value, rpc.RpcError)
@@ -103,13 +122,22 @@ class _RpcErrorWithData(rpc.RpcError):
         self.data = data
 
 
-def test_client_errors_keeps_the_data_a_client_release_carries() -> None:
-    """`data` reaches this package's `RpcError` where the client has one."""
-    error = _RpcErrorWithData("getrawtransaction: not found", -5, {"tx": 1})
-    with pytest.raises(RpcError) as exc, client_errors():
+def test_client_errors_drops_the_data_a_client_release_carries() -> None:
+    """`data` does not reach this package's `RpcError`, nor its text.
+
+    Section 7 of the btclib-org standard, *A refusal carries no secret*:
+    `data` is the node's, and can quote the request.
+    """
+    error = _RpcErrorWithData("getrawtransaction: not found", -5, {"tx": "key"})
+    with (
+        pytest.raises(RpcError, match=_AN_RPC_ERROR.format(-5)) as exc,
+        client_errors(),
+    ):
         raise error
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
     assert exc.value.code == -5
-    assert exc.value.data == {"tx": 1}
+    assert exc.value.data is None
 
 
 def test_tx_id_hex_takes_whatever_octets_takes() -> None:
@@ -276,7 +304,7 @@ def test_block_header_from_raw_returns_a_checked_header() -> None:
     ],
 )
 def test_block_header_from_raw_reports_what_is_not_a_header(raw: str) -> None:
-    """Wrap an unparsable body in a FetchError naming the height."""
+    """Wrap an unparsable body in a FetchError naming a block header."""
     with pytest.raises(FetchError, match="^block header:"):
         block_header_from_raw(raw, network="mainnet")
 
@@ -285,7 +313,7 @@ def test_block_header_from_raw_checks_the_work_against_the_network_given() -> No
     """Regtest's genesis is within regtest's limit and beyond mainnet's."""
     header = block_header_from_raw(REGTEST_GENESIS_HEADER_RAW, network="regtest")
     assert header.hash == NETWORKS["regtest"].genesis_block
-    with pytest.raises(FetchError, match="^block header: .*above the limit"):
+    with pytest.raises(FetchError, match="^block header: a malformed answer"):
         block_header_from_raw(REGTEST_GENESIS_HEADER_RAW, network="mainnet")
 
 
@@ -293,13 +321,13 @@ def test_block_header_from_raw_holds_signet_to_signets_limit() -> None:
     """Signet's genesis is within signet's limit and beyond mainnet's."""
     header = block_header_from_raw(SIGNET_GENESIS_HEADER_RAW, network="signet")
     assert header.hash == NETWORKS["signet"].genesis_block
-    with pytest.raises(FetchError, match="^block header: .*above the limit"):
+    with pytest.raises(FetchError, match="^block header: a malformed answer"):
         block_header_from_raw(SIGNET_GENESIS_HEADER_RAW, network="mainnet")
 
 
 def test_block_header_from_raw_refuses_a_regtest_header_for_signet() -> None:
     """Signet's limit is not regtest's."""
-    with pytest.raises(FetchError, match="^block header: .*above the limit"):
+    with pytest.raises(FetchError, match="^block header: a malformed answer"):
         block_header_from_raw(REGTEST_GENESIS_HEADER_RAW, network="signet")
 
 
@@ -310,7 +338,7 @@ def test_block_header_from_raw_holds_the_hash_to_the_target_its_bits_claim() -> 
     below regtest's limit, and above the target those bits name.
     """
     claimed = f"{REGTEST_GENESIS_HEADER_RAW[:-16]}ffff001d01000000"
-    with pytest.raises(FetchError, match="^block header: invalid proof-of-work"):
+    with pytest.raises(FetchError, match="^block header: a malformed answer"):
         block_header_from_raw(claimed, network="regtest")
 
 
@@ -330,7 +358,7 @@ def test_block_header_from_raw_refuses_a_header_with_no_proof_of_work() -> None:
     this exists to enforce.
     """
     forged = f"{TIP_HEADER_RAW[:-8]}00000000"
-    with pytest.raises(FetchError, match="^block header: invalid proof"):
+    with pytest.raises(FetchError, match="^block header: a malformed answer"):
         block_header_from_raw(forged, network="mainnet")
 
 
