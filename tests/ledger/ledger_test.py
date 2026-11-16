@@ -13,6 +13,8 @@ bitcoind's wallet.
 
 from __future__ import annotations
 
+import contextlib
+import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -32,6 +34,7 @@ from btclib_wallet.bip32.bip32 import derive, prv_keyinfo_from_xprv, xpub_from_x
 from btclib_wallet.descriptors import parse
 from btclib_wallet.exceptions import FetchError
 from btclib_wallet.fetch.history import BlockRef, ScriptHistory
+from btclib_wallet.fetch.relay_fees import RelayFees
 from btclib_wallet.ledger import (
     LOOKAHEAD,
     Balances,
@@ -43,8 +46,23 @@ from btclib_wallet.ledger.ledger import _KEEP_SPAN, _SYNC_ATTEMPTS, _parents_fir
 from btclib_wallet.psbt.psbt import Psbt, extract_tx, finalize
 from btclib_wallet.psbt_signer import SoftwareSigner
 from btclib_wallet.wallet import DescriptorWallet
+from tests.ledger import (
+    Alias,
+    Below,
+    IntWithNoClass,
+    NotBelow,
+    ObjectClaimingInt,
+    Twin,
+)
 from tests.ledger.conftest import LOOKAHEAD as SMALL_LOOKAHEAD
-from tests.ledger.conftest import XPRV, FakeChain, script_of, source, tampered
+from tests.ledger.conftest import (
+    REFUSED_BROADCAST,
+    XPRV,
+    FakeChain,
+    script_of,
+    source,
+    tampered,
+)
 from tests.refused_value_test import HEX, SPELLINGS
 from tests.secret_free import assert_secret_free
 
@@ -141,11 +159,11 @@ def test_addresses_are_handed_out_in_order(ledger: Ledger) -> None:
     assert ledger.new_address() == wallet.address(0, 0)
     assert ledger.new_address() == wallet.address(0, 1)
     assert ledger.new_change_address() == wallet.address(1, 0)
-    with pytest.raises(BTClibValueError, match="no source 1"):
+    with pytest.raises(BTClibValueError, match="no source an int of 1 bits"):
         ledger.new_address(1)
     with pytest.raises(BTClibTypeError, match="invalid source type"):
         ledger.new_address("0")  # type: ignore[arg-type]
-    with pytest.raises(BTClibValueError, match="invalid branch: 2"):
+    with pytest.raises(BTClibValueError, match="invalid branch: an int of 2 bits"):
         ledger.new_address(0, 2)
     with pytest.raises(BTClibTypeError, match="invalid script_pub_key type"):
         ledger.position_of(b"")  # type: ignore[arg-type]
@@ -278,6 +296,83 @@ def test_a_source_is_checked(ledger: Ledger) -> None:
         ledger.new_address(0, "0")  # type: ignore[arg-type]
 
 
+def test_a_source_and_a_branch_are_the_ints_they_hold(
+    chain: FakeChain, path: Path
+) -> None:
+    """Whatever an int subclass's own `==` and hash claim.
+
+    `Alias(1)` claims to be 0, and is source 1 in what is handed out and
+    in what is written: after a load neither source hands its change
+    address out again. A `Twin` equals nothing but itself, and is the
+    source or the branch it holds, the label it is given set on that
+    source's address.
+    """
+    assert (Alias(1) == 0, hash(Alias(1)) == hash(0), Twin(1) == 1) == (
+        True,
+        True,
+        False,
+    )
+    first, second = source(), source("wpkh({}/84h/1h/9h/{}/*)")
+    with Ledger.create(path, "regtest", chain) as ledger:
+        ledger.add_source(first, lookahead=SMALL_LOOKAHEAD)
+        ledger.add_source(second, lookahead=SMALL_LOOKAHEAD)
+        assert ledger.new_change_address(Alias(1)) == second.address(1, 0)
+        assert ledger.new_address(Twin(0), Twin(1)) == first.address(1, 0)
+        assert ledger.new_address(Twin(0), Twin(0), label="t") == first.address(0, 0)
+        assert ledger.label_of(first.address(0, 0)) == "t"
+    with contextlib.closing(sqlite3.connect(path)) as db:
+        rows = db.execute("SELECT * FROM handed_out ORDER BY 1, 2").fetchall()
+    assert rows == [(0, 0, 0), (0, 1, 0), (1, 1, 0)]
+    with Ledger.load(path, "regtest", chain) as again:
+        assert again.new_change_address(0) == first.address(1, 1)
+        assert again.new_change_address(1) == second.address(1, 1)
+
+
+def test_a_lookahead_and_a_birth_height_are_the_ints_they_hold(
+    chain: FakeChain, path: Path
+) -> None:
+    """Checked and written as the int held, whatever `<` claims of it.
+
+    A birth height of 0 is the exact 0 too.
+    """
+    assert (Below(0) < 0, NotBelow(-1) < 0) == (True, False)
+    with Ledger.create(path, "regtest", chain) as ledger:
+        with pytest.raises(BTClibValueError, match="negative lookahead"):
+            ledger.add_source(source(), lookahead=NotBelow(-1))
+        with pytest.raises(BTClibValueError, match="negative birth_height"):
+            ledger.add_source(source(), NotBelow(-1))
+        source_id = ledger.add_source(source(), Below(0), lookahead=Below(2))
+        held = (ledger._lookahead[source_id], ledger._birth[source_id])
+        assert [(type(value), value) for value in held] == [(int, 2), (int, 0)]
+    with contextlib.closing(sqlite3.connect(path)) as db:
+        rows = db.execute("SELECT lookahead, birth FROM sources").fetchall()
+    assert rows == [(2, 0)]
+
+
+def test_a_height_is_an_int_by_its_type_whatever_its_class_claims(
+    chain: FakeChain, path: Path
+) -> None:
+    """An object that claims int is refused, an int whose class raises is not.
+
+    `isinstance`, which `is_integer` asks, reads `__class__`.
+    """
+    claimant = ObjectClaimingInt()
+    with Ledger.create(path, "regtest", chain) as ledger:
+        with pytest.raises(BTClibTypeError, match="^invalid lookahead type: Object"):
+            ledger.add_source(source(), lookahead=claimant)  # type: ignore[arg-type]
+        with pytest.raises(BTClibTypeError, match="^invalid birth_height type: Obj"):
+            ledger.add_source(source(), claimant)  # type: ignore[arg-type]
+        source_id = ledger.add_source(
+            source(), IntWithNoClass(3), lookahead=IntWithNoClass(2)
+        )
+        held = (ledger._lookahead[source_id], ledger._birth[source_id])
+        assert [(type(value), value) for value in held] == [(int, 2), (int, 3)]
+    # what isinstance reads of each, which the ledger must not ask
+    with pytest.raises(RuntimeError, match="no __class__"):
+        isinstance(IntWithNoClass(3), bool)
+    assert isinstance(claimant, int)
+
+
 def test_a_ledger_with_no_source_does_not_sync(chain: FakeChain, path: Path) -> None:
     """Refused before any read, whatever the reader."""
     with (
@@ -317,13 +412,50 @@ def test_a_replaced_transaction_is_kept_inactive(
     assert [d.category for d in info.details] == ["send", "send"]
 
 
+def test_a_refusal_of_the_callers_backend_relays_none_of_its_text(
+    ledger: Ledger, chain: FakeChain, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reader, the broadcaster and the fee reader are the caller's code.
+
+    A `FetchError` each raises is refused by its class, whether the ledger
+    raises it or `resubmit` returns it (issue #935).
+    """
+    _funded(ledger, chain)
+
+    def no_fees() -> RelayFees:
+        raise FetchError(f"no fees for {HEX}")
+
+    monkeypatch.setattr(chain, "get_relay_fees", no_fees)
+    with pytest.raises(FetchError, match="^get_relay_fees: no usable") as e:
+        ledger.spend([_outside()])
+    refusals = [e.value]
+    monkeypatch.undo()
+    chain.refuse = f"refused {HEX}"
+    with pytest.raises(FetchError, match=f"^{REFUSED_BROADCAST}$") as e:
+        ledger.spend([_outside()])
+    refusals += [e.value, *ledger.resubmit().values()]
+    assert [str(refusal) for refusal in refusals[1:]] == [REFUSED_BROADCAST] * 2
+
+    def leak() -> None:
+        raise FetchError(f"no history for {HEX}")
+
+    chain.on_read.append(leak)
+    with pytest.raises(FetchError, match="^get_history: no usable") as e:
+        ledger.sync()
+    refusals.append(e.value)
+    for refusal in refusals:
+        assert refusal.__cause__ is None
+        assert refusal.__context__ is None
+        assert_secret_free(refusal, SPELLINGS)
+
+
 def test_a_refused_broadcast_stays_as_nonmempool(
     ledger: Ledger, chain: FakeChain
 ) -> None:
     """Recorded first, so a refusal keeps it: wallet_balance.py 214-225."""
     _funded(ledger, chain)
     chain.refuse = "min relay fee not met"
-    with pytest.raises(FetchError, match="min relay fee not met"):
+    with pytest.raises(FetchError, match=f"^{REFUSED_BROADCAST}$"):
         ledger.spend([_outside()])
     (refused,) = [
         info for info in ledger.transactions if info.wallet_tx.state is TxState.INACTIVE
@@ -614,7 +746,9 @@ def test_a_backend_that_pruned_the_block_held_fails_each_sync(
     chain.mine(count=8)
     for _ in range(2):
         chain.reads.clear()
-        with pytest.raises(FetchError, match="pruned"):
+        # the reader is the caller's: its refusal is relayed by its class
+        err_msg = "^get_history: no usable answer from the server: FetchError$"
+        with pytest.raises(FetchError, match=err_msg):
             ledger.sync()
         assert chain.reads == [12, 11, 10, 9, 8]
         assert ledger.tip == tip
@@ -896,7 +1030,10 @@ def test_the_fee_rate_is_the_callers_the_estimate_or_the_fallback(
     # the caller's, refused below the relay minimum
     funded = ledger.fund([_outside()], FeeRate.from_sats_per_vbyte(2))
     assert funded.fee == funded.psbt.vsize_estimate() * 2
-    with pytest.raises(BTClibValueError, match="below the minimum relay rate"):
+    err_msg = (
+        "^fee rate an int of 10 bits is below the minimum relay rate 2000 sat/kvB$"
+    )
+    with pytest.raises(BTClibValueError, match=err_msg):
         ledger.fund([_outside()], FeeRate.from_sats_per_vbyte(1))
     with pytest.raises(BTClibTypeError, match="invalid fee_rate type"):
         ledger.fund([_outside()], 2)  # type: ignore[arg-type]
@@ -954,7 +1091,7 @@ def test_a_source_of_one_branch_takes_its_change_there(
         _funded(ledger, chain)
         spent = ledger.spend([_outside()], FeeRate.from_sats_per_vbyte(1))
         assert ledger.position_of(spent.vout[1].script_pub_key) == (0, 0, 1)
-        with pytest.raises(BTClibValueError, match="invalid branch: 1"):
+        with pytest.raises(BTClibValueError, match="invalid branch: an int of 1 bits"):
             ledger.new_change_address()
 
 

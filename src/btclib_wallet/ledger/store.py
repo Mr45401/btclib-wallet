@@ -66,6 +66,14 @@ connection is collected.
 Every write a sync makes is one SQLite transaction, so a process killed
 mid-write leaves the file as the last whole sync left it.
 
+`sqlite3` binds a value of a subclass of int, str or bytes through the
+value's own `__conform__` where it has one, on CPython and on PyPy, and
+PyPy's `_sqlite3` reads its `__class__` and its methods as well. So
+what the store binds of an argument a caller handed a `Ledger`, and of
+a block height or id a reader answered, is what `_exact` returns: of
+such a subclass, the int, str or bytes the value holds, read with none
+of its methods.
+
 A backup is a new file written through SQLite's backup API, as Core's
 `SQLiteDatabase::Backup` writes one (src/wallet/sqlite.cpp:356-381 at
 bitcoin/bitcoin@f0de87f040): a copy of every page of the file as one
@@ -93,7 +101,13 @@ from btclib.exceptions import BTClibValueError
 from btclib.network import NETWORKS
 from btclib.tx import Tx
 
-from btclib_wallet._refusal import _label, _message_text, _quoted
+from btclib_wallet._refusal import (
+    _exact,
+    _label,
+    _message_text,
+    _position,
+    _quoted,
+)
 from btclib_wallet.fetch.fetcher import tx_for_network
 from btclib_wallet.fetch.history import BlockRef
 from btclib_wallet.ledger.crypto import _assert_cost, _MasterKey
@@ -315,7 +329,7 @@ def _decoded(text: str, source_id: int, column: str) -> dict[str, str]:
     except ValueError:
         decoded = None
     if not isinstance(decoded, dict):
-        err_msg = f"not a ledger file: source {_quoted(source_id)}'s {column}"
+        err_msg = f"not a ledger file: source {_position(source_id)}'s {column}"
         err_msg += " is not a JSON object"
         raise BTClibValueError(err_msg)
     return decoded
@@ -360,7 +374,7 @@ def _branches(value: object, source_id: int) -> dict[int, str]:
     source alone, before `int` reads it (issue #900).
     """
     if not isinstance(value, dict) or not all(_is_branch(b) for b in value):
-        err_msg = f"not a ledger file: source {_quoted(source_id)}'s descriptors"
+        err_msg = f"not a ledger file: source {_position(source_id)}'s descriptors"
         err_msg += " are not keyed by branch"
         raise BTClibValueError(err_msg)
     return {int(b): text for b, text in value.items()}
@@ -408,7 +422,7 @@ def _tx_state(value: object) -> TxState:
 def _encrypted(value: object, source_id: int) -> bytes | None:
     """Return a source's ciphertext, None where it has none."""
     if value is not None and not isinstance(value, bytes):
-        err_msg = f"not a ledger file: source {_quoted(source_id)}'s encrypted keys"
+        err_msg = f"not a ledger file: source {_position(source_id)}'s encrypted keys"
         err_msg += " are no blob"
         raise BTClibValueError(err_msg)
     return value
@@ -722,7 +736,7 @@ class _Store:
         with self._db:
             self._db.execute(
                 "INSERT OR REPLACE INTO labels VALUES (?, ?, ?)",
-                (script, label, purpose),
+                (script, _exact(label), purpose),
             )
 
     def next_source_id(self) -> int:
@@ -748,8 +762,8 @@ class _Store:
                         _descriptors_text(source.descriptors),
                         json.dumps(dict(source.prv_keys)),
                         source.encrypted,
-                        source.lookahead,
-                        source.birth,
+                        _exact(source.lookahead),
+                        _exact(source.birth),
                         int(source.scanned),
                     ),
                 )
@@ -803,7 +817,8 @@ class _Store:
 
     def _insert_handed_out(self, positions: Iterable[tuple[int, int, int]]) -> None:
         self._db.executemany(
-            "INSERT OR IGNORE INTO handed_out VALUES (?, ?, ?)", list(positions)
+            "INSERT OR IGNORE INTO handed_out VALUES (?, ?, ?)",
+            [(_exact(s), _exact(b), i) for s, b, i in positions],
         )
 
     def upsert_txs(self, txs: Iterable[WalletTx]) -> None:
@@ -819,11 +834,11 @@ class _Store:
                     wtx.tx.id,
                     wtx.tx.serialize(include_witness=True),
                     wtx.state.value,
-                    None if wtx.block is None else wtx.block.height,
-                    None if wtx.block is None else wtx.block.block_id,
+                    None if wtx.block is None else _exact(wtx.block.height),
+                    None if wtx.block is None else _exact(wtx.block.block_id),
                     wtx.seq,
-                    wtx.comment,
-                    wtx.comment_to,
+                    _exact(wtx.comment),
+                    _exact(wtx.comment_to),
                     wtx.replaces,
                     wtx.replaced_by,
                 )
@@ -843,11 +858,14 @@ class _Store:
         with self._db:
             self._db.executemany(
                 "DELETE FROM blocks WHERE height = ?",
-                [(height,) for height in write.dropped],
+                [(_exact(height),) for height in write.dropped],
             )
             self._db.executemany(
                 "INSERT OR REPLACE INTO blocks VALUES (?, ?)",
-                [(block.height, block.block_id) for block in write.blocks],
+                [
+                    (_exact(block.height), _exact(block.block_id))
+                    for block in write.blocks
+                ],
             )
             self._db.executemany(
                 "DELETE FROM txs WHERE txid = ?", [(txid,) for txid in write.deleted]
@@ -880,7 +898,7 @@ def _descriptors_text(descriptors: Mapping[int, str]) -> str:
 def _write_tip(db: sqlite3.Connection, tip: BlockRef) -> None:
     """Write the tip into `meta`."""
     rows: Mapping[str, str] = {
-        "tip_height": str(tip.height),
-        "tip_id": tip.block_id.hex(),
+        "tip_height": str(_exact(tip.height)),
+        "tip_id": _exact(tip.block_id).hex(),
     }
     db.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", list(rows.items()))

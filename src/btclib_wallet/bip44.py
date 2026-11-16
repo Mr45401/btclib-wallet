@@ -56,7 +56,7 @@ from btclib.network import (
 from btclib.script.taproot import output_pubkey
 from btclib.utils import bytes_from_octets, is_integer
 
-from btclib_wallet._refusal import _quoted
+from btclib_wallet._refusal import _position, _quoted
 from btclib_wallet.bip32.bip32 import (
     BIP32Key,
     BIP32KeyData,
@@ -70,7 +70,6 @@ from btclib_wallet.bip32.der_path import (
     HARDENED_OFFSET,
     DerPath,
     indexes_from_der_path,
-    str_from_index_int,
 )
 from btclib_wallet.bip32.key_origin import BIP32KeyOrigin
 from btclib_wallet.descriptors.descriptors import (
@@ -81,6 +80,7 @@ from btclib_wallet.descriptors.descriptors import (
     WpkhDescriptor,
 )
 from btclib_wallet.descriptors.key_expression import KeyExpression
+from btclib_wallet.exceptions import _caller_errors, _guarded
 
 # under TYPE_CHECKING: `btclib_wallet.fetch` imports every fetcher, and
 # `urllib`, `ssl` and `socket` behind them, which a caller deriving an
@@ -90,6 +90,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "SCRIPT_TYPE_FROM_PURPOSE",
+    "AccountDiscovery",
     "AccountUse",
     "BIP44ScriptType",
     "account_descriptors",
@@ -244,7 +245,7 @@ def _script_type_from_purpose(purpose: int) -> BIP44ScriptType:
     """
     script_type = SCRIPT_TYPE_FROM_PURPOSE.get(purpose)
     if script_type is None:
-        known = ", ".join(_quoted(each) for each in sorted(SCRIPT_TYPE_FROM_PURPOSE))
+        known = ", ".join(_position(each) for each in sorted(SCRIPT_TYPE_FROM_PURPOSE))
         err_msg = f"unknown BIP44 purpose: {_quoted(purpose)} not in ({known});"
         err_msg += " pass script_type to say what it means"
         raise BTClibValueError(err_msg)
@@ -281,7 +282,7 @@ def _assert_valid_coin_type(coin_type: int, xkey: BIP32KeyData) -> None:
 
     key_network_type = network_type_from_xkeyversion(xkey.version)
     if network_type != key_network_type:
-        err_msg = f"coin type {_quoted(coin_type)} is {_quoted(network_type)},"
+        err_msg = f"coin type {_position(coin_type)} is {_quoted(network_type)},"
         err_msg += f" the extended key is {_quoted(key_network_type)}"
         raise BTClibValueError(err_msg)
 
@@ -307,15 +308,13 @@ def _indexes_left_to_derive(xkey: BIP32KeyData, indexes: list[int]) -> list[int]
     handed has walked past its end, whichever of the two paths it is.
     """
     if xkey.depth > len(indexes):
-        err_msg = f"invalid key depth: {_quoted(xkey.depth)} is past the {len(indexes)}"
-        err_msg += " levels of the path"
+        err_msg = f"invalid key depth: {_quoted(xkey.depth)} is past the"
+        err_msg += f" {len(indexes)} levels of the path"
         raise BTClibValueError(err_msg)
 
     if xkey.depth and xkey.index != indexes[xkey.depth - 1]:
-        key_index = _quoted(str_from_index_int(xkey.index))
-        err_msg = f"key index {key_index} at depth {_quoted(xkey.depth)}"
-        path_index = _quoted(str_from_index_int(indexes[xkey.depth - 1]))
-        err_msg += f" is not the path's {path_index}"
+        err_msg = f"key index {_quoted(xkey.index)} at depth {_quoted(xkey.depth)}"
+        err_msg += f" is not the path's {_position(indexes[xkey.depth - 1])}"
         raise BTClibValueError(err_msg)
 
     return indexes[xkey.depth :]
@@ -553,6 +552,20 @@ class AccountUse:
     history: ScriptHistory
 
 
+@dataclass(frozen=True)
+class AccountDiscovery:
+    """The used accounts of a key, and the purposes whose xpubs ended first.
+
+    `accounts` holds the used accounts alone, in the order read, keyed by
+    (purpose, account). `cut_short` holds the purposes whose xpubs ended
+    before the account gap was reached, in the order read, as
+    `discover_accounts` says.
+    """
+
+    accounts: dict[tuple[int, int], AccountUse]
+    cut_short: tuple[int, ...]
+
+
 def _assert_limit(value: int, name: str) -> None:
     """Refuse a limit that is no integer, or that is below one."""
     if not is_integer(value):
@@ -639,7 +652,9 @@ def _scanned_indexes(
             for index in range(read, end)
             for script_pub_key in descriptor.script_pub_keys(index)
         }
-        paid = _paid(reader.get_history(sorted(index_of)), index_of)
+        with _caller_errors("get_history"):
+            history = reader.get_history(sorted(index_of))
+        paid = _paid(history, index_of)
         used.extend(sorted({index_of[script] for script in paid}))
         read = end
     return used
@@ -664,7 +679,8 @@ def _discover_account(
     }
     if not position_of:
         return None
-    history = reader.get_history(sorted(position_of))
+    with _caller_errors("get_history"):
+        history = reader.get_history(sorted(position_of))
     paid = {position_of[script] for script in _paid(history, position_of)}
     if not paid:
         return None
@@ -675,6 +691,7 @@ def _discover_account(
     return AccountUse(descriptors, used, history)
 
 
+@_guarded
 def discover_account(
     descriptors: Sequence[Descriptor],
     reader: HistoryReader,
@@ -713,7 +730,7 @@ def _account_branches(
     """
     key = key_data_from_bip32_key(xkey)
     if key.is_private:
-        err_msg = f"purpose {_quoted(purpose)}, account {_quoted(account)}:"
+        err_msg = f"purpose {_position(purpose)}, account {_position(account)}:"
         err_msg += " an extended private key: pass its xpub"
         raise BTClibValueError(err_msg)
     coin_type = _COIN_TYPE_FROM_NETWORK_TYPE[network_type_from_xkeyversion(key.version)]
@@ -736,11 +753,11 @@ def _accounts(
             raise BTClibTypeError(f"invalid purpose type: {type(purpose).__name__}")
         # a str is a Sequence too, of one-character keys
         if not isinstance(xpubs, Sequence) or isinstance(xpubs, (str, bytes)):
-            err_msg = f"purpose {_quoted(purpose)}: invalid xpubs type:"
+            err_msg = f"purpose {_position(purpose)}: invalid xpubs type:"
             err_msg += f" {type(xpubs).__name__}"
             raise BTClibTypeError(err_msg)
         if not xpubs:
-            raise BTClibValueError(f"purpose {_quoted(purpose)}: no account xpub")
+            raise BTClibValueError(f"purpose {_position(purpose)}: no account xpub")
         accounts[purpose] = [
             _account_branches(xpub, purpose, account, master_fingerprint)
             for account, xpub in enumerate(xpubs)
@@ -748,6 +765,7 @@ def _accounts(
     return accounts
 
 
+@_guarded
 def discover_accounts(
     account_xpubs: Mapping[int, Sequence[BIP32Key]],
     reader: HistoryReader,
@@ -755,8 +773,8 @@ def discover_accounts(
     *,
     account_gap: int = 1,
     gap_limit: int = _GAP_LIMIT,
-) -> dict[tuple[int, int], AccountUse]:
-    """Return the used accounts of a key, by purpose and account.
+) -> AccountDiscovery:
+    """Return the used accounts of a key, and the purposes cut short.
 
     BIP44's *Account discovery*, from the account xpubs alone.
     `account_xpubs` maps each purpose to its account xpubs, account 0
@@ -767,12 +785,12 @@ def discover_accounts(
     The accounts of each purpose are read in order with
     `discover_account`, until `account_gap` accounts in a row have no
     history. BIP44 stops at the first one, which is the default. A wider
-    gap finds a key whose wallet skipped an account. Where the xpubs of a
-    purpose end before the gap is reached, the discovery is refused, since
-    an account after them may be used: pass more xpubs.
+    gap finds a key whose wallet skipped an account.
 
-    The answer holds the used accounts alone, in the order read, keyed by
-    (purpose, account).
+    Where the xpubs of a purpose end before the gap is reached, the
+    purpose is cut short: an account after them may be used, and more
+    xpubs would read it. Its used accounts are in the answer all the
+    same, and the next purpose is read.
 
     An extended private key is refused: the account levels are hardened,
     so an xpub per account is what a scan needs, and the private key stays
@@ -784,20 +802,18 @@ def discover_accounts(
     accounts = _accounts(account_xpubs, master_fingerprint)
 
     found: dict[tuple[int, int], AccountUse] = {}
+    cut_short: list[int] = []
     for purpose, branches in accounts.items():
         unused = 0
-        account = 0
-        while unused < account_gap:
-            if account == len(branches):
-                err_msg = f"purpose {_quoted(purpose)}: no xpub for account"
-                err_msg += f" {_quoted(account)}, and {_quoted(unused)} of"
-                err_msg += f" {_quoted(account_gap)} unused accounts in a row"
-                raise BTClibValueError(err_msg)
-            use = _discover_account(branches[account], reader, gap_limit)
+        for account, account_branches in enumerate(branches):
+            use = _discover_account(account_branches, reader, gap_limit)
             if use is None:
                 unused += 1
+                if unused == account_gap:
+                    break
             else:
                 unused = 0
                 found[purpose, account] = use
-            account += 1
-    return found
+        else:
+            cut_short.append(purpose)
+    return AccountDiscovery(found, tuple(cut_short))

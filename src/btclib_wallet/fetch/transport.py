@@ -92,9 +92,14 @@ from bitcoin_core_rpc import (
 from btclib.exceptions import BTClibTypeError, BTClibValueError
 from btclib.utils import is_integer
 
-from btclib_wallet._refusal import _message_text, _quoted
+from btclib_wallet._refusal import _message_text, _position, _quoted
 from btclib_wallet.electrum import _reply_ids, _request_ids
 from btclib_wallet.exceptions import FetchError as _PackageFetchError
+from btclib_wallet.exceptions import (
+    _failed_exchange,
+    _failure_class,
+    _guarded_methods,
+)
 
 LineTransport = Callable[[bytes, float], bytes]
 
@@ -182,7 +187,8 @@ def _time_left(deadline: float, timeout: float, where: str) -> float:
     """
     remaining = deadline - monotonic()
     if remaining <= 0:
-        raise _TransportError(f"{where}: timeout expired before an answer arrived")
+        err_msg = f"{where}: timeout expired before an answer arrived"
+        raise _failed_exchange(_TransportError(err_msg), TimeoutError)
     return min(remaining, timeout)
 
 
@@ -259,13 +265,15 @@ def _read_line(
             del buffer[: end + 1]
             return line
         if len(buffer) > max_line_size:
-            err_msg = f"{where}: line longer than the max_line_size of {_quoted(max_line_size)}"
+            err_msg = f"{where}: line longer than the max_line_size of "
+            err_msg += _position(max_line_size)
             raise _TransportError(err_msg)
         connection.settimeout(_time_left(deadline, timeout, where))
         if chunk := connection.recv(min(_READ_CHUNK, max_line_size + 1 - len(buffer))):
             buffer.extend(chunk)
         else:
-            raise _TransportError(f"{where}: connection closed before a whole line")
+            err_msg = f"{where}: connection closed before a whole line"
+            raise _failed_exchange(_TransportError(err_msg), EOFError)
 
 
 def _valid_endpoint(host: str, port: int, max_line_size: int) -> None:
@@ -343,9 +351,11 @@ def _exchange(
     _valid_request(request)
     valid_timeout(timeout)
 
-    where = f"{_quoted(host)}:{_quoted(port)}"
+    where = f"{_quoted(host)}:{_position(port)}"
     deadline = monotonic() + timeout
     failure = ""
+    failure_type: type[BaseException] | None = None
+    line: bytes | None = None
     try:
         with _open_connection((host, port), deadline, timeout, where) as sock:
             connection = sock
@@ -355,7 +365,7 @@ def _exchange(
             with connection:
                 connection.settimeout(_time_left(deadline, timeout, where))
                 connection.sendall(request)
-                return _read_line(
+                line = _read_line(
                     connection, bytearray(), max_line_size, where, deadline, timeout
                 )
     except OSError as e:
@@ -364,9 +374,20 @@ def _exchange(
         # Named by its class and raised after the block, so it is not
         # chained: a certificate that does not match names the host
         failure = type(e).__name__
-    raise _TransportError(f"no answer from {where}: {failure}")
+        # a close that fails once the line is read is refused all the
+        # same, but its class says nothing of the answer: `failure_type`
+        # stays None, as `TlsLineTransport` says
+        if line is None:
+            failure_type = _failure_class(type(e))
+    else:
+        # returned once both blocks closed, so that a close that fails
+        # refuses the call
+        return line
+    err_msg = f"no answer from {where}: {failure}"
+    raise _failed_exchange(_TransportError(err_msg), failure_type)
 
 
+@_guarded_methods
 class TlsLineTransport:
     """A `LineTransport` over TLS to one server, verifying its certificate.
 
@@ -416,7 +437,10 @@ class TlsLineTransport:
     connection closed before a whole line, a line over the limit -- is a
     `_TransportError`: `bitcoin_core_rpc`'s `FetchError`, the contract
     `LineTransport` states, and this package's own, which `ElectrumFetcher`
-    lets through as it is.
+    lets through as it is. Its `failure_type` is set as `FetchError`'s
+    docstring in `btclib_wallet.exceptions` says, and is None where the
+    server sent what is refused, as a line over the limit, and for a
+    close.
     """
 
     def __init__(
@@ -470,6 +494,7 @@ class TlsLineTransport:
         )
 
 
+@_guarded_methods
 class TcpLineTransport:
     """A `LineTransport` over plain TCP to one server.
 
@@ -553,6 +578,7 @@ def _line_ids(line: bytes, where: str) -> frozenset[int] | None:
     return ids
 
 
+@_guarded_methods
 class PersistentTlsLineTransport:
     """A `LineTransport` over one TLS connection, kept across calls.
 
@@ -663,7 +689,7 @@ class PersistentTlsLineTransport:
                 connection.close()
                 return
             raise _TransportError(
-                f"closing {_quoted(self._host)}:{_quoted(self._port)}"
+                f"closing {_quoted(self._host)}:{_position(self._port)}"
             )
 
     def _discard(self) -> None:
@@ -682,11 +708,13 @@ class PersistentTlsLineTransport:
         ids = _request_ids(request)
         valid_timeout(timeout)
 
-        where = f"{_quoted(self._host)}:{_quoted(self._port)}"
+        where = f"{_quoted(self._host)}:{_position(self._port)}"
         deadline = monotonic() + timeout
         if not self._lock.acquire(timeout=timeout):
-            raise _TransportError(f"{where}: timeout expired before an answer arrived")
+            err_msg = f"{where}: timeout expired before an answer arrived"
+            raise _failed_exchange(_TransportError(err_msg), TimeoutError)
         failure = ""
+        failure_type: type[BaseException] | None = None
         try:
             return self._answer(request, ids, where, deadline, timeout)
         except OSError as e:
@@ -695,9 +723,11 @@ class PersistentTlsLineTransport:
             # Named by its class and raised after the block, as
             # `_exchange` does
             failure = type(e).__name__
+            failure_type = _failure_class(type(e))
         finally:
             self._lock.release()
-        raise _TransportError(f"no answer from {where}: {failure}")
+        err_msg = f"no answer from {where}: {failure}"
+        raise _failed_exchange(_TransportError(err_msg), failure_type)
 
     def _answer(
         self,

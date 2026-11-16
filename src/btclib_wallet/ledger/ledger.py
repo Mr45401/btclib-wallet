@@ -285,11 +285,11 @@ from btclib.tx.limits import COINBASE_MATURITY
 from btclib.tx.tx_in import input_weight
 from btclib.utils import assert_type, is_integer
 
-from btclib_wallet._refusal import _label, _quoted
+from btclib_wallet._refusal import _exact, _exact_int, _label, _position, _quoted
 from btclib_wallet.bip32.bip32 import fingerprint
 from btclib_wallet.coin_selection import Candidate, select_coins
 from btclib_wallet.descriptors import normalized, parse
-from btclib_wallet.exceptions import FetchError
+from btclib_wallet.exceptions import FetchError, _caller_errors, _guarded_methods
 from btclib_wallet.fetch.balance import script_pub_key_for_network
 from btclib_wallet.fetch.broadcaster import Broadcaster
 from btclib_wallet.fetch.fee_estimator import FeeEstimator, valid_confirmation_target
@@ -342,7 +342,10 @@ from btclib_wallet.tx_builder import (
     _ShortfallError,
     build_psbt,
 )
-from btclib_wallet.wallet.descriptor_wallet import DescriptorWallet
+from btclib_wallet.wallet.descriptor_wallet import (
+    DescriptorWallet,
+    _assert_int_type,
+)
 
 __all__ = ["LOOKAHEAD", "MAX_UNLOCK_TIME", "Ledger"]
 
@@ -532,6 +535,7 @@ class _Read:
     scanned: frozenset[int]
 
 
+@_guarded_methods
 class Ledger:
     """A set of descriptor wallets, their transactions, and their file.
 
@@ -784,8 +788,8 @@ class Ledger:
         """
         assert_type(wallet, DescriptorWallet, "wallet")
         if birth_height is not None:
-            _assert_height(birth_height, "birth_height")
-        _assert_height(lookahead, "lookahead")
+            birth_height = _checked_height(birth_height, "birth_height")
+        lookahead = _checked_height(lookahead, "lookahead")
         if wallet.network != self.network:
             # each network between commas, where no article stands before
             # what `_label` writes of one it does not know: either
@@ -794,7 +798,7 @@ class Ledger:
             err_msg += f" is not the ledger's, {_label(self.network, NETWORKS)}"
             raise BTClibValueError(err_msg)
         if label is not None:
-            _assert_label(label)
+            label = _checked_label(label)
             if 0 not in wallet.branches or wallet.descriptor(0).is_ranged:
                 raise BTClibValueError("a label needs one address on branch 0")
         scanned = birth_height is None
@@ -860,9 +864,7 @@ class Ledger:
         return tuple(self._sources[i] for i in sorted(self._sources))
 
     def _source(self, source: int) -> DescriptorWallet:
-        """Return the source of an id, refusing an unknown one."""
-        if not is_integer(source):
-            raise BTClibTypeError(f"invalid source type: {type(source).__name__}")
+        """Return the source of an int id, refusing an unknown one."""
         if source not in self._sources:
             raise BTClibValueError(f"no source {_quoted(source)}")
         return self._sources[source]
@@ -910,10 +912,14 @@ class Ledger:
             self._txs = txs
 
     def _new_position(self, source: int, branch: int) -> _Position:
-        """Return the position the next address of a branch is at."""
+        """Return the position the next address of a branch is at.
+
+        The source and the branch are the ints they hold, as `_int_held`
+        reads them.
+        """
+        source = _int_held(source, "source")
         wallet = self._source(source)
-        if not is_integer(branch):
-            raise BTClibTypeError(f"invalid branch type: {type(branch).__name__}")
+        branch = _int_held(branch, "branch")
         if branch not in wallet.branches:
             raise BTClibValueError(f"invalid branch: {_quoted(branch)}")
         if not wallet.descriptor(branch).is_ranged:
@@ -933,8 +939,9 @@ class Ledger:
         not given is "", as the module docstring says.
         """
         if label is not None:
-            _assert_label(label)
+            label = _checked_label(label)
         position = self._new_position(source, branch)
+        source, branch, _ = position
         address = self._hand_out(position)
         self._store.add_handed_out([position])
         self._extend_windows()
@@ -984,8 +991,7 @@ class Ledger:
         Core's `setlabel`. A label the address had is replaced.
         """
         script = self._script_of(address)
-        _assert_label(label)
-        self._write_label(script, label)
+        self._write_label(script, _checked_label(label))
 
     def _receive_ends(self) -> dict[int, int]:
         """Return the next index of each source's branch 0, by source id."""
@@ -1064,7 +1070,7 @@ class Ledger:
 
         Core's `getaddressesbylabel`. A label no address has is refused.
         """
-        _assert_label(label)
+        label = _checked_label(label)
         if not (
             found := {
                 self._address(script): purpose
@@ -1092,12 +1098,13 @@ class Ledger:
 
         The module docstring says how. A tip that moves between the reads
         of one sync starts it again, at most `_SYNC_ATTEMPTS` times in
-        all, and then raises `FetchError`. A backend's own `FetchError` is
-        raised as it comes, and nothing is written. The tip height the
-        sync records is checked by `fetcher.block_header_height`, and a
-        height it refuses raises `FetchError`, as a malformed answer of
-        the reader, before anything is written. A ledger with no source is
-        refused, having no script to ask about.
+        all, and then raises `FetchError`. A `FetchError` of the reader is
+        raised as `btclib_wallet.exceptions._caller_errors` says, and
+        nothing is written. The tip height the sync records is checked by
+        `fetcher.block_header_height`, and a height it refuses raises
+        `FetchError`, as a malformed answer of the reader, before anything
+        is written. A ledger with no source is refused, having no script
+        to ask about.
         """
         if not self._sources:
             raise BTClibValueError("no source: add one before the sync")
@@ -1178,7 +1185,8 @@ class Ledger:
 
     def _history(self, scripts: Iterable[bytes], start: int) -> ScriptHistory:
         """Ask the reader, from `start` or from its tip where that is lower."""
-        return self._reader.get_history(sorted(scripts), start)
+        with _caller_errors("get_history"):
+            return self._reader.get_history(sorted(scripts), start)
 
     def _walk_down(
         self, scripts: frozenset[bytes], tip: BlockRef
@@ -1534,7 +1542,7 @@ class Ledger:
         Core's `getreceivedbylabel`. A label no address has is refused,
         and so is one that only addresses of others have.
         """
-        _assert_label(label)
+        label = _checked_label(label)
         _assert_height(min_depth, "min_depth")
         assert_type(include_immature_coinbase, bool, "include_immature_coinbase")
         scripts = {
@@ -1646,10 +1654,9 @@ class Ledger:
         relay = self._relay_fees()
         if fee_rate is not None:
             if relay is not None and fee_rate < relay.min_relay:
-                err_msg = (
-                    f"fee rate {_quoted(fee_rate.sats_per_kvbyte)} sat/kvB is below"
-                )
-                err_msg += f" the minimum relay rate {_quoted(relay.min_relay.sats_per_kvbyte)}"
+                err_msg = f"fee rate {_quoted(fee_rate.sats_per_kvbyte)} is below"
+                err_msg += " the minimum relay rate "
+                err_msg += f"{_position(relay.min_relay.sats_per_kvbyte)} sat/kvB"
                 raise BTClibValueError(err_msg)
             return fee_rate
         rate = self._estimated(_CONFIRMATION_TARGET, relay)
@@ -1679,7 +1686,8 @@ class Ledger:
         """Return the node's relay fee floors, None with no reader to ask."""
         if self._relay_fee_reader is None:
             return None
-        return self._relay_fee_reader.get_relay_fees()
+        with _caller_errors("get_relay_fees"):
+            return self._relay_fee_reader.get_relay_fees()
 
     def _psbt_in(self, parent: Tx, vout: int, sequence: int) -> PsbtIn:
         """Return the input map spending an output of the ledger, updated."""
@@ -1910,9 +1918,8 @@ class Ledger:
         except _WrongKeyError:
             if was_held and not self._holds(key):
                 raise BTClibValueError(_LOCKED_DURING) from None
-            err_msg = (
-                f"not a ledger file: source {_quoted(source_id)}'s keys do not decrypt"
-            )
+            err_msg = f"not a ledger file: source {_position(source_id)}'s keys"
+            err_msg += " do not decrypt"
             raise BTClibValueError(err_msg) from None
         held = None
         try:
@@ -1924,13 +1931,12 @@ class Ledger:
         finally:
             _wipe(plaintext)
         if not isinstance(held, dict):
-            err_msg = (
-                f"not a ledger file: source {_quoted(source_id)}'s keys are unreadable"
-            )
+            err_msg = f"not a ledger file: source {_position(source_id)}'s keys"
+            err_msg += " are unreadable"
             raise BTClibValueError(err_msg)
         prv_keys = held.get("prv_keys")
         if not isinstance(prv_keys, dict):
-            err_msg = f"not a ledger file: source {_quoted(source_id)}'s prv_keys"
+            err_msg = f"not a ledger file: source {_position(source_id)}'s prv_keys"
             err_msg += " is not a JSON object"
             raise BTClibValueError(err_msg)
         return _wallet(
@@ -1963,8 +1969,8 @@ class Ledger:
         address once it creates the transaction
         (src/wallet/spend.cpp:1432-1434).
         """
-        assert_type(comment, (str, type(None)), "comment")
-        assert_type(comment_to, (str, type(None)), "comment_to")
+        comment = _checked_comment(comment, "comment")
+        comment_to = _checked_comment(comment_to, "comment_to")
         if self._broadcaster is None:
             raise BTClibValueError("no broadcaster: the ledger cannot send")
         if self._master_key is not None:
@@ -2002,7 +2008,8 @@ class Ledger:
             written.append(replaced)
         self._store.upsert_txs(written)
         self._txs.update((w.tx.id, w) for w in written)
-        broadcaster.broadcast(tx)
+        with _caller_errors("broadcast"):
+            broadcaster.broadcast(tx)
         written = [replace(wtx, state=TxState.MEMPOOL)]
         if replaced is not None and replaced.state is TxState.MEMPOOL:
             written.append(replace(replaced, state=TxState.INACTIVE))
@@ -2224,11 +2231,9 @@ class Ledger:
         """
         if fee_rate is not None:
             if relay is not None and fee_rate < relay.mempool_min:
-                err_msg = (
-                    f"fee rate {_quoted(fee_rate.sats_per_kvbyte)} sat/kvB is below"
-                )
+                err_msg = f"fee rate {_quoted(fee_rate.sats_per_kvbyte)} is below"
                 err_msg += " the mempool's minimum"
-                err_msg += f" {_quoted(relay.mempool_min.sats_per_kvbyte)}"
+                err_msg += f" {_position(relay.mempool_min.sats_per_kvbyte)} sat/kvB"
                 raise BTClibValueError(err_msg)
             return fee_rate
         incremental = (
@@ -2340,7 +2345,8 @@ class Ledger:
             if wtx.state not in (TxState.MEMPOOL, TxState.INACTIVE):
                 continue
             try:
-                self._broadcaster.broadcast(wtx.tx)
+                with _caller_errors("broadcast"):
+                    self._broadcaster.broadcast(wtx.tx)
             except FetchError as e:
                 refused[wtx.tx.id] = e
                 continue
@@ -2513,7 +2519,7 @@ class Ledger:
         A ciphertext with no master key to decrypt it is refused, and so
         are keys in plain text in an encrypted file.
         """
-        err_msg = f"not a ledger file: source {_quoted(source_id)}'s keys"
+        err_msg = f"not a ledger file: source {_position(source_id)}'s keys"
         if source.prv_keys and self._master_key is not None:
             raise BTClibValueError(f"{err_msg} are plain in an encrypted file")
         if source.encrypted is not None:
@@ -2670,8 +2676,8 @@ def _fee_from_change(
     amount = value - (fee - probe.fee)
     if amount < dust_threshold(_script(change)):
         reason = "to pay the fee" if amount < 0 else "to send after the fee"
-        err_msg = f"the amount, {_quoted(value)} satoshi, is too small {reason}, "
-        err_msg += _quoted(fee)
+        err_msg = f"the amount, {_quoted(value)}, is too small {reason}, "
+        err_msg += f"{_position(fee)} satoshi"
         raise BTClibValueError(err_msg)
     _assert_fee_within(fee, vsize, DEFAULT_MAX_FEE, DEFAULT_MAX_FEE_RATE)
     psbt.outputs[0].amount = amount
@@ -2709,9 +2715,9 @@ def _assert_replaces(old_fee: int, fee: int, vsize: int, incremental: FeeRate) -
     """
     least = old_fee + fee_from_vsize(vsize, incremental)
     if fee < least:
-        err_msg = f"insufficient total fee {_quoted(fee)} satoshi, must be at least "
-        err_msg += f"{_quoted(least)} (old fee {_quoted(old_fee)} + incremental fee "
-        err_msg += f"{_quoted(least - old_fee)})"
+        err_msg = f"insufficient total fee {_quoted(fee)}, must be at least "
+        err_msg += f"{_position(least)} satoshi (old fee {_position(old_fee)}"
+        err_msg += f" + incremental fee {_position(least - old_fee)})"
         raise BTClibValueError(err_msg)
 
 
@@ -2781,12 +2787,44 @@ def _script(tx_out: TxOut) -> bytes:
     return tx_out.script_pub_key.script
 
 
-def _assert_label(label: str) -> None:
-    """Refuse what is not a label, and the name `*`."""
-    if not isinstance(label, str):
-        raise BTClibTypeError(f"invalid label type: {type(label).__name__}")
-    if label == "*":
+def _int_held(value: int, name: str) -> int:
+    """Refuse a value whose type is no int, or is bool; return the int held.
+
+    The int is the one `_exact_int` reads, as `DescriptorWallet` reads a
+    branch label: whatever a subclass's own `==` and hash claim, every
+    lookup and comparison, what the ledger holds and what it writes are
+    that int.
+    """
+    _assert_int_type(value, name)
+    return _exact_int(value)
+
+
+def _checked_label(label: str) -> str:
+    """Refuse what is not a label, and the name `*`; return the str held.
+
+    Its type decides, as `_quoted` says, since a `__class__` can claim
+    str, or raise. The str is the one `_exact` copies, compared and kept
+    as `_int_held` says of an int.
+    """
+    kind = type(label)
+    if not issubclass(kind, str):
+        raise BTClibTypeError(f"invalid label type: {kind.__name__}")
+    text = _exact(label)
+    if text == "*":
         raise BTClibValueError("invalid label name: *")
+    return text
+
+
+def _checked_comment(comment: str | None, name: str) -> str | None:
+    """Refuse what is not a str or None; return the str held, or None.
+
+    Its type decides, as `_checked_label` says, and the str is the one
+    `_exact` copies.
+    """
+    kind = type(comment)
+    if comment is not None and not issubclass(kind, str):
+        raise BTClibTypeError(f"invalid {name} type: {kind.__name__}")
+    return _exact(comment)
 
 
 def _assert_height(value: int, name: str) -> None:
@@ -2795,6 +2833,18 @@ def _assert_height(value: int, name: str) -> None:
         raise BTClibTypeError(f"invalid {name} type: {type(value).__name__}")
     if value < 0:
         raise BTClibValueError(f"negative {name}: {_quoted(value)}")
+
+
+def _checked_height(value: int, name: str) -> int:
+    """Refuse what is not a non-negative integer; return the int held.
+
+    Its type decides, as `_int_held` says, and the int is the one
+    `_exact_int` reads, compared and kept as `_int_held` says.
+    """
+    number = _int_held(value, name)
+    if number < 0:
+        raise BTClibValueError(f"negative {name}: {_quoted(number)}")
+    return number
 
 
 def _next_index(handed: set[_Position], source: int, branch: int) -> int:

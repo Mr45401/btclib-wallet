@@ -82,7 +82,7 @@ from btclib.script.witness import Witness
 from btclib.utils import assert_type
 from typing_extensions import override
 
-from btclib_wallet._refusal import _exact_int, _label, _quoted
+from btclib_wallet._refusal import _exact_int, _label, _position
 from btclib_wallet.bip32.bip32 import BIP32Key
 from btclib_wallet.bip32.der_path import DerPath
 from btclib_wallet.bip44 import BIP44ScriptType, account_descriptors
@@ -141,30 +141,39 @@ def _assert_distinct(
                 found = ranged.index_of(first[fixed], _LAST_INDEX, prv_keys)
                 shared = found is not None
             if shared:
-                err_msg = f"branches {_quoted(branch_a)} and {_quoted(branch_b)} share a script:"
+                err_msg = f"branches {_position(branch_a)} and"
+                err_msg += f" {_position(branch_b)} share a script:"
                 err_msg += " position_of could not tell them apart"
                 raise BTClibValueError(err_msg)
+
+
+def _assert_int_type(value: object, name: str) -> None:
+    """Refuse a value unless its type is int or an int subclass but bool.
+
+    The type decides, as `_quoted` says, since a `__class__` can claim
+    int or bool, or raise. `name` is what the refusal calls the value.
+    """
+    kind = type(value)
+    if not issubclass(kind, int) or kind is bool:
+        raise BTClibTypeError(f"invalid {name} type: {kind.__name__}")
 
 
 def _labels(by_branch: Mapping[int, Descriptor]) -> dict[int, Descriptor]:
     """Refuse a label that is no integer, or is outside 0 to 2**63 - 1.
 
     The module docstring says why. No value refusal prints the value: an
-    int past the interpreter's digit limit has no str(). The type decides
-    whether a label is an int, as `_quoted` says, since a `__class__` can
-    claim one or raise. Each label is kept as the exact int `_exact_int`
-    reads: the str() of an IntEnum can be its name, which a ledger would
-    write and could not read back, and a subclass's `__int__` can answer
-    another number. Two labels holding one int are refused, since one
-    descriptor would replace the other.
+    int past the interpreter's digit limit has no str().
+    `_assert_int_type` decides whether a label is an int. Each label
+    is kept as the exact int `_exact_int` reads: the str() of an IntEnum
+    can be its name, which a ledger would write and could not read back,
+    and a subclass's `__int__` can answer another number. Two labels
+    holding one int are refused, since one descriptor would replace the
+    other.
     """
     labels: dict[int, Descriptor] = {}
     for branch, descriptor in by_branch.items():
         # a caller can hand any key, whatever the annotation says
-        kind: type[object] = type(branch)
-        if not issubclass(kind, int) or kind is bool:
-            err_msg = f"invalid branch type: {kind.__name__}"
-            raise BTClibTypeError(err_msg)
+        _assert_int_type(branch, "branch")
         value = _exact_int(branch)
         if value < 0:
             raise BTClibValueError("invalid branch: negative")
@@ -211,7 +220,7 @@ class DescriptorWallet(RangedWallet):
         for branch, descriptor in by_branch.items():
             _assert_no_wif(descriptor)
             if isinstance(descriptor, ComboDescriptor):
-                err_msg = f"combo() at branch {_quoted(branch)}: four scripts at one"
+                err_msg = f"combo() at branch {_position(branch)}: four scripts at one"
                 err_msg += " index are four addresses at one position, so a"
                 err_msg += " wallet cannot hold one -- Descriptor"
                 err_msg += ".script_pub_keys is what answers for it"
@@ -418,6 +427,10 @@ class DescriptorWallet(RangedWallet):
         as the wallet's own is a claim about where money goes, and the
         whole script is the only evidence for it. `position_of` is the
         same claim asked as a question.
+
+        It also refuses a descriptor whose expansion gives a taproot
+        merkle root and no tree, for the reason `psbt.update_psbt_output`
+        gives.
         """
         self._assert_position(branch, index)
         return update_psbt_output(

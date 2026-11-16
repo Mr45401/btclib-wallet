@@ -75,8 +75,13 @@ from btclib.tx import Tx
 from btclib.utils import bytes_from_octets, is_integer
 from typing_extensions import override
 
-from btclib_wallet._refusal import _code, _label, _message_text, _quoted
-from btclib_wallet.exceptions import FetchError, HttpError
+from btclib_wallet._refusal import _code, _label, _message_text, _position, _quoted
+from btclib_wallet.exceptions import (
+    FetchError,
+    HttpError,
+    _caller_errors,
+    _guarded_methods,
+)
 from btclib_wallet.fetch.balance import Balance, script_pub_key_for_network
 from btclib_wallet.fetch.fee_estimator import FeeQuote, valid_confirmation_target
 from btclib_wallet.fetch.fetcher import (
@@ -219,6 +224,7 @@ def _checked_base_url(base_url: str) -> str:
     return base_url
 
 
+@_guarded_methods
 class EsploraFetcher(NetworkVerifyingFetcher):
     """Every `Fetcher` question, answered by an Esplora instance over HTTP.
 
@@ -388,7 +394,9 @@ class EsploraFetcher(NetworkVerifyingFetcher):
         self._verify_once()
         height = block_header_height(height)
         block_hash = self._block_id_at(height).hex()
-        raw = self.text(f"/block/{block_hash}/header", _MAX_HEADER_BODY)
+        # `text` may be a method of the caller's own subclass
+        with _caller_errors("text"):
+            raw = self.text(f"/block/{block_hash}/header", _MAX_HEADER_BODY)
         return block_header_from_raw(raw, network=self.network)
 
     @override
@@ -629,7 +637,9 @@ class EsploraFetcher(NetworkVerifyingFetcher):
         confirmed = sorted(
             blocks, key=lambda tx_id: (blocks[tx_id].height, positions[tx_id])
         )
-        txs = [HistoryTx(self.get_tx(tx_id), blocks[tx_id]) for tx_id in confirmed]
+        # `get_tx` may be a method of the caller's own subclass
+        with _caller_errors("get_tx"):
+            txs = [HistoryTx(self.get_tx(tx_id), blocks[tx_id]) for tx_id in confirmed]
         for tx_id in mempool:
             tx = self._mempool_tx(tx_id)
             if tx is not None:
@@ -683,7 +693,9 @@ class EsploraFetcher(NetworkVerifyingFetcher):
     def _mempool_tx(self, tx_id: str) -> Tx | None:
         """Return a mempool transaction, `None` where the explorer lacks it."""
         try:
-            return self.get_tx(tx_id)
+            # `get_tx` may be a method of the caller's own subclass
+            with _caller_errors("get_tx"):
+                return self.get_tx(tx_id)
         except HttpError as e:
             if e.status != 404:
                 raise
@@ -697,9 +709,9 @@ class EsploraFetcher(NetworkVerifyingFetcher):
         positions: dict[str, int] = {}
         for ref in sorted(set(blocks.values()), key=lambda ref: ref.height):
             if self._block_id_at(ref.height) != ref.block_id:
-                err_msg = f"a block that is not at height {_quoted(ref.height)}"
+                err_msg = f"a block that is not at height {_position(ref.height)}"
                 raise FetchError(err_msg)
-            source = f"txids of block {_quoted(ref.height)}"
+            source = f"txids of block {_position(ref.height)}"
             with _fetch_errors(source):
                 reply = self._json(
                     f"/block/{ref.block_id.hex()}/txids", _MAX_TXIDS_BODY
@@ -733,7 +745,7 @@ class EsploraFetcher(NetworkVerifyingFetcher):
                 raise BTClibTypeError(f"not an array: {type(page).__name__}")
             tx_ids = [tx_id_hex(_member(entry, "txid")) for entry in page]
         if len(tx_ids) < cast(int, count):
-            err_msg = f"{source}: {len(tx_ids)} of {_quoted(count)}"
+            err_msg = f"{source}: {len(tx_ids)} of {_position(count)}"
             err_msg += " mempool transactions listed"
             raise FetchError(err_msg)
         return tx_ids

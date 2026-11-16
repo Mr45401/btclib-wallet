@@ -28,8 +28,10 @@ from btclib_wallet.psbt.psbt import Psbt, extract_tx, finalize
 from btclib_wallet.psbt.psbt_size import miniscript_sizer
 from btclib_wallet.psbt_signer import SoftwareSigner
 from btclib_wallet.wallet import DescriptorWallet
+from tests.ledger import ConformingStr, ObjectClaimingStr, StrWithNoClass
 from tests.ledger.conftest import (
     ONE_SAT,
+    REFUSED_BROADCAST,
     XPRV,
     FakeChain,
     script_of,
@@ -123,6 +125,47 @@ def test_comments_are_kept_with_a_spend_and_in_the_file(
         ledger.spend([_outside()], comment_to=1)  # type: ignore[arg-type]
 
 
+def test_a_comment_is_written_as_the_str_it_holds(
+    ledger: Ledger, chain: FakeChain, path: Path
+) -> None:
+    """The str each holds, kept and written whatever its own methods answer.
+
+    An empty comment is the exact "" too.
+    """
+    _funded(ledger, chain)
+    spent = ledger.spend(
+        [_outside()], comment=ConformingStr("c"), comment_to=ConformingStr("")
+    )
+    kept = _wtx(ledger, spent)
+    assert (type(kept.comment), type(kept.comment_to)) == (str, str)
+    ledger.close()
+    with Ledger.load(path, "regtest", chain) as loaded:
+        held = _wtx(loaded, spent)
+        assert (held.comment, held.comment_to) == ("c", "")
+
+
+def test_a_comment_is_a_str_by_its_type_whatever_its_class_claims(
+    ledger: Ledger, chain: FakeChain
+) -> None:
+    """An object that claims str is refused, a str whose class raises is not."""
+    claimant = ObjectClaimingStr()
+    _funded(ledger, chain)
+    with pytest.raises(BTClibTypeError, match="^invalid comment type: Object"):
+        ledger.spend([_outside()], comment=claimant)  # type: ignore[arg-type]
+    with pytest.raises(BTClibTypeError, match="^invalid comment_to type: Object"):
+        ledger.spend([_outside()], comment_to=claimant)  # type: ignore[arg-type]
+    spent = ledger.spend(
+        [_outside()], comment=StrWithNoClass("c"), comment_to=StrWithNoClass("t")
+    )
+    kept = _wtx(ledger, spent)
+    held = [(type(text), text) for text in (kept.comment, kept.comment_to)]
+    assert held == [(str, "c"), (str, "t")]
+    # what isinstance reads of each, which the ledger must not ask
+    with pytest.raises(RuntimeError, match="no __class__"):
+        isinstance(StrWithNoClass("c"), bool)
+    assert isinstance(claimant, str)
+
+
 def test_a_bump_replaces_the_spend_and_links_the_two(
     ledger: Ledger, chain: FakeChain, path: Path
 ) -> None:
@@ -196,13 +239,18 @@ def test_a_named_rate_pays_the_incremental_rate_over_the_replacement(
     _funded(ledger, chain)
     # the spend paid 2 sat/vB, and the node's incremental rate is 1
     spent = ledger.spend([_outside()])
-    with pytest.raises(BTClibValueError, match="insufficient total fee"):
+    # the fee refused is described, and the least it must be is written
+    err_msg = r"^insufficient total fee an int of \d+ bits, must be at least \d+ "
+    with pytest.raises(BTClibValueError, match=err_msg):
         ledger.bump_psbt(spent.id, _rate(2))
     bumped = ledger.bump_psbt(spent.id, _rate(3))
     vsize = bumped.psbt.vsize_estimate(miniscript_sizer)
     assert bumped.fee == bumped.old_fee + vsize
     chain.relay = RelayFees(ONE_SAT, _rate(5), ONE_SAT)
-    with pytest.raises(BTClibValueError, match="below the mempool's minimum 5000"):
+    with pytest.raises(
+        BTClibValueError,
+        match="^fee rate an int of 12 bits is below the mempool's minimum 5000 sat/kvB$",
+    ):
         ledger.bump_psbt(spent.id, _rate(4))
 
 
@@ -271,7 +319,9 @@ def test_the_change_index_names_the_output_taking_the_change(
     foreign = ledger.bump_psbt(spent.id, original_change_index=0)
     assert foreign.psbt.outputs[2].amount == 30_000 - (foreign.fee - foreign.old_fee)
     assert not foreign.psbt.outputs[2].hd_key_paths
-    with pytest.raises(BTClibValueError, match="change index 3 is out of range"):
+    with pytest.raises(
+        BTClibValueError, match="change index an int of 2 bits is out of range"
+    ):
         ledger.bump_psbt(spent.id, original_change_index=3)
     with pytest.raises(BTClibValueError, match="incompatible"):
         ledger.bump_psbt(spent.id, outputs=[_outside()], original_change_index=0)
@@ -378,7 +428,8 @@ def test_every_output_change_pays_the_fee(ledger: Ledger, chain: FakeChain) -> N
         [TxOut(99_800, receive)],
     )
     assert single.vin[0].sequence == 0xFFFFFFFF
-    with pytest.raises(BTClibValueError, match="too small to pay the fee"):
+    err_msg = r"^the amount, an int of \d+ bits, is too small to pay the fee, \d+ "
+    with pytest.raises(BTClibValueError, match=err_msg):
         ledger.bump_psbt(single.id, _rate(1_100), original_change_index=0)
     bumped = ledger.bump(single.id, _rate(10), original_change_index=0)
     assert len(bumped.vin) == len(bumped.vout) == 1
@@ -654,7 +705,7 @@ def test_a_refused_replacement_stays_linked_and_inactive(
     _funded(ledger, chain)
     spent = ledger.spend([_outside()])
     chain.refuse = "insufficient fee"
-    with pytest.raises(FetchError, match="insufficient fee"):
+    with pytest.raises(FetchError, match=f"^{REFUSED_BROADCAST}$"):
         ledger.bump(spent.id)
     (refused,) = [
         info.wallet_tx
@@ -678,7 +729,7 @@ def test_a_refused_replacement_resubmitted_takes_the_replaced_ones_place(
     _funded(ledger, chain)
     spent = ledger.spend([_outside()])
     chain.refuse = "insufficient fee"
-    with pytest.raises(FetchError, match="insufficient fee"):
+    with pytest.raises(FetchError, match=f"^{REFUSED_BROADCAST}$"):
         ledger.bump(spent.id)
     refused = _wtx(ledger, spent).replaced_by
     assert refused is not None
@@ -695,7 +746,7 @@ def test_a_refused_replacement_resubmitted_takes_the_replaced_ones_place(
     ledger.sync()
     ledger.abandon(abandoned.id)
     chain.refuse = "insufficient fee"
-    with pytest.raises(FetchError, match="insufficient fee"):
+    with pytest.raises(FetchError, match=f"^{REFUSED_BROADCAST}$"):
         ledger.bump(abandoned.id, _rate(5))
     again = _wtx(ledger, abandoned).replaced_by
     assert again is not None
@@ -716,7 +767,7 @@ def test_a_resubmitted_original_refused_is_left_by_its_replacement(
     _funded(ledger, chain)
     spent = ledger.spend([_outside()])
     chain.refuse = "insufficient fee"
-    with pytest.raises(FetchError, match="insufficient fee"):
+    with pytest.raises(FetchError, match=f"^{REFUSED_BROADCAST}$"):
         ledger.bump(spent.id)
     replacement = _wtx(ledger, spent).replaced_by
     assert replacement is not None
@@ -747,14 +798,14 @@ def test_a_refusal_hands_out_the_change_and_nothing_else(
         _funded(ledger, chain)
     receive = ledger.sources[0].script_pub_key(0, 3)
     chain.refuse = "refused"
-    with pytest.raises(FetchError, match="refused"):
+    with pytest.raises(FetchError, match=f"^{REFUSED_BROADCAST}$"):
         ledger.spend([_outside(), TxOut(20_000, receive)])
     assert ledger.new_change_address() == ledger.sources[0].address(1, 1)
     assert ledger.new_address() == ledger.sources[0].address(0, 3)
     chain.refuse = ""
     spent = ledger.spend([_outside()])
     chain.refuse = "refused"
-    with pytest.raises(FetchError, match="refused"):
+    with pytest.raises(FetchError, match=f"^{REFUSED_BROADCAST}$"):
         ledger.bump(spent.id, outputs=[_outside(20_000)])
     assert ledger.new_change_address() == ledger.sources[0].address(1, 4)
 

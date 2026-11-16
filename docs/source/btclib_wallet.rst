@@ -19,6 +19,13 @@ Subpackages
 Submodules
 ----------
 
+btclib\_wallet.bip139 module
+----------------------------
+
+.. automodule:: btclib_wallet.bip139
+   :members:
+   :show-inheritance:
+
 btclib\_wallet.bip21 module
 ---------------------------
 
@@ -30,6 +37,13 @@ btclib\_wallet.bip322 module
 ----------------------------
 
 .. automodule:: btclib_wallet.bip322
+   :members:
+   :show-inheritance:
+
+btclib\_wallet.bip329 module
+----------------------------
+
+.. automodule:: btclib_wallet.bip329
    :members:
    :show-inheritance:
 
@@ -121,6 +135,13 @@ btclib\_wallet.psbt\_signer\_contract module
 --------------------------------------------
 
 .. automodule:: btclib_wallet.psbt_signer_contract
+   :members:
+   :show-inheritance:
+
+btclib\_wallet.recovery\_paths module
+-------------------------------------
+
+.. automodule:: btclib_wallet.recovery_paths
    :members:
    :show-inheritance:
 
