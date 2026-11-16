@@ -12,11 +12,15 @@ says where an item is, or how many there are, with `_position`.
 
 `_exact_int` and `_exact` read the int, str or bytes a value of a
 subclass holds, with none of its methods, which is how a refusal
-measures one and how a ledger reads and writes one.
+measures one and how a ledger reads and writes one. `_assert_int_type`
+refuses a value whose type is no int, or is bool, deciding by the type
+as `_quoted` does.
 """
 
 from collections.abc import Collection
 from typing import TypeVar, cast
+
+from btclib.exceptions import BTClibTypeError
 
 __all__: list[str] = []
 
@@ -28,6 +32,17 @@ _T = TypeVar("_T")
 # Bitcoin Core's, and the codes electrs, ElectrumX, Fulcrum and Floresta
 # assign lie in it, and it is too narrow to carry a key
 _RPC_CODES = range(-(2**15), 2**15)
+
+
+def _assert_int_type(value: object, name: str) -> None:
+    """Refuse a value unless its type is int or an int subclass but bool.
+
+    The type decides, as `_quoted` says, since a `__class__` can claim
+    int or bool, or raise. `name` is what the refusal calls the value.
+    """
+    kind = type(value)
+    if not issubclass(kind, int) or kind is bool:
+        raise BTClibTypeError(f"invalid {name} type: {kind.__name__}")
 
 
 def _exact_int(value: int) -> int:

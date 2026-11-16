@@ -82,7 +82,7 @@ from btclib.script.witness import Witness
 from btclib.utils import assert_type
 from typing_extensions import override
 
-from btclib_wallet._refusal import _exact_int, _label, _position
+from btclib_wallet._refusal import _assert_int_type, _exact_int, _label, _position
 from btclib_wallet.bip32.bip32 import BIP32Key
 from btclib_wallet.bip32.der_path import DerPath
 from btclib_wallet.bip44 import BIP44ScriptType, account_descriptors
@@ -145,17 +145,6 @@ def _assert_distinct(
                 err_msg += f" {_position(branch_b)} share a script:"
                 err_msg += " position_of could not tell them apart"
                 raise BTClibValueError(err_msg)
-
-
-def _assert_int_type(value: object, name: str) -> None:
-    """Refuse a value unless its type is int or an int subclass but bool.
-
-    The type decides, as `_quoted` says, since a `__class__` can claim
-    int or bool, or raise. `name` is what the refusal calls the value.
-    """
-    kind = type(value)
-    if not issubclass(kind, int) or kind is bool:
-        raise BTClibTypeError(f"invalid {name} type: {kind.__name__}")
 
 
 def _labels(by_branch: Mapping[int, Descriptor]) -> dict[int, Descriptor]:

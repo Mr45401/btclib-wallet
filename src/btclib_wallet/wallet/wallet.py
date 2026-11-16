@@ -69,7 +69,7 @@ from btclib.network import validated_network_name
 from btclib.script.script_pub_key import ScriptPubKey, script_from_script_pub_key
 from btclib.utils import is_integer, str_from_string
 
-from btclib_wallet._refusal import _position, _quoted
+from btclib_wallet._refusal import _assert_int_type, _position, _quoted
 
 __all__ = [
     "AddressInfo",
@@ -281,15 +281,15 @@ class RangedWallet(Wallet, ABC):
     def _assert_position(self, branch: int, index: int) -> None:
         """Refuse a position this wallet has no output at.
 
-        The branch as an integer -- `True == 1` and `1.0 == 1` pass
-        membership in `branches` -- and against `branches`, which is the
-        one bound every subclass shares; the index only for the sign, its
-        upper bound being the subclass's own -- 65535 from
-        `bip32.derive_from_account` where the branch is derived, and
-        BIP32's own limit where a descriptor derives it.
+        The branch first as an int, by `_assert_int_type`, since
+        `True == 1` and `1.0 == 1` pass membership in `branches`; then
+        against `branches`, which is the one bound every subclass
+        shares. The index only for the sign, its upper bound being the
+        subclass's own -- 65535 from `bip32.derive_from_account` where
+        the branch is derived, and BIP32's own limit where a descriptor
+        derives it.
         """
-        if not is_integer(branch):
-            raise BTClibTypeError(f"invalid branch type: {type(branch).__name__}")
+        _assert_int_type(branch, "branch")
         if branch not in self.branches:
             branches = ", ".join(_position(b) for b in self.branches)
             err_msg = f"invalid branch: {_quoted(branch)} not in ({branches})"

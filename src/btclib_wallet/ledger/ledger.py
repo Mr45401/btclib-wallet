@@ -285,7 +285,14 @@ from btclib.tx.limits import COINBASE_MATURITY
 from btclib.tx.tx_in import input_weight
 from btclib.utils import assert_type, is_integer
 
-from btclib_wallet._refusal import _exact, _exact_int, _label, _position, _quoted
+from btclib_wallet._refusal import (
+    _assert_int_type,
+    _exact,
+    _exact_int,
+    _label,
+    _position,
+    _quoted,
+)
 from btclib_wallet.bip32.bip32 import fingerprint
 from btclib_wallet.coin_selection import Candidate, select_coins
 from btclib_wallet.descriptors import normalized, parse
@@ -342,10 +349,7 @@ from btclib_wallet.tx_builder import (
     _ShortfallError,
     build_psbt,
 )
-from btclib_wallet.wallet.descriptor_wallet import (
-    DescriptorWallet,
-    _assert_int_type,
-)
+from btclib_wallet.wallet.descriptor_wallet import DescriptorWallet
 
 __all__ = ["LOOKAHEAD", "MAX_UNLOCK_TIME", "Ledger"]
 
